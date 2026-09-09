@@ -852,3 +852,109 @@ def test_secret_in_custom_event_never_reaches_client(peer):
 
     _code, stderr = p.close()
     assert CONTRACT_FAKE_KEY not in stderr
+
+
+# ----------------------------------------------------------------------
+# 同 session 生命周期：延后 close 与隔离（真实 JSON-RPC 上的形态）
+# ----------------------------------------------------------------------
+
+
+def test_close_during_turn_then_resume_cannot_start_concurrent_turn(peer):
+    """`session/close` 落在 turn 运行中时，resume 回来也不得开出并发 turn。
+
+    这是最危险的一条绕行路径：ACP SDK 并发分发 request 与 notification，客户端
+    完全可以在 close 之后立刻 `session/resume` 拉回同一个 thread_id 再发 prompt。
+    若 close 立即摘除注册项，`_running` 就查不到了，新旧 worker 会在取消宽限期内
+    并发写同一条 DeerFlow checkpoint。正确行为：close 只置取消标志并延后摘除，
+    resume 拿回的仍是那个正在跑的会话，第二个 prompt 必须被 -32011 拒绝。
+    """
+    p = peer(
+        {"events": TEXT_EVENTS, "stall_before_first_yield_s": 30, "threads": {}},
+        env_extra={**WORKER_PATH_ENV, "DEERFLOW_ACP_CANCEL_GRACE_SECONDS": "0.5"},
+    )
+    p.initialize()
+    session_id = p.new_session()
+
+    rid = p.send("session/prompt", {"sessionId": session_id, "prompt": [{"type": "text", "text": "你好"}]})
+    _worker_pid, worker_pgid = _wait_worker_ids(p)
+    assert _pgid_alive(worker_pgid)
+
+    # close 与 resume 都在 turn 仍在跑的时候发出。close 是 request（不是
+    # notification），SDK router 只按方法名分发 request；发成通知会被直接丢弃。
+    p.send("session/close", {"sessionId": session_id})
+    rid_resume = p.send("session/resume", {"cwd": "/tmp", "sessionId": session_id, "mcpServers": []})
+    resume_resp = p.await_response(rid_resume, timeout=30)
+    assert "error" not in resume_resp, f"resume 不该报错（会话仍在途）：{resume_resp.get('error')}"
+
+    rid2 = p.send("session/prompt", {"sessionId": session_id, "prompt": [{"type": "text", "text": "抢跑"}]})
+    second = p.await_response(rid2, timeout=30)
+    assert second["error"]["code"] == -32011, f"并发 prompt 未被拒绝：{second}"
+
+    # 第一轮（被 close 触发取消）正常收敛，且返回时进程组已死
+    first = p.await_response(rid, timeout=30)
+    assert first["result"]["stopReason"] == "cancelled"
+    assert not _pgid_alive(worker_pgid), "close 触发的取消返回后 worker 进程组仍存活"
+
+    # 在途 turn 终结后，close 才真正生效：注册项已摘除，且脚本里没有该 thread
+    # 的 checkpoint，于是 resume 只能按未知会话拒绝。
+    rid3 = p.send("session/resume", {"cwd": "/tmp", "sessionId": session_id, "mcpServers": []})
+    assert p.await_response(rid3, timeout=30)["error"]["code"] == -32001
+
+    p.proc.kill()
+    p.proc.wait(timeout=5)
+
+
+def test_unconfirmed_group_quarantines_session_over_the_wire(peer):
+    """无法确认进程组排空时，同 session 的后续 prompt/resume 必须被 -32012 拒绝。
+
+    反例形态：`worker_reaped=False` 仍无条件释放 `_running`，下一个 turn 就在
+    可能仍活着的旧执行体旁边启动，两者并发写同一条 thread 的 checkpoint。
+    """
+    p = peer(
+        {"events": TEXT_EVENTS, "stall_before_first_yield_s": 30, "threads": {"reuse": []}},
+        env_extra={
+            **WORKER_PATH_ENV,
+            "DEERFLOW_ACP_CANCEL_GRACE_SECONDS": "0.5",
+            "DEERFLOW_ACP_FAKE_FORCE_UNREAPED": "1",
+        },
+    )
+    p.initialize()
+    session_id = p.new_session()
+
+    rid = p.send("session/prompt", {"sessionId": session_id, "prompt": [{"type": "text", "text": "你好"}]})
+    _worker_pid, worker_pgid = _wait_worker_ids(p)
+    p.send("session/cancel", {"sessionId": session_id}, notification=True)
+    resp = p.await_response(rid, timeout=40)
+    assert resp["result"]["stopReason"] == "cancelled"
+
+    # 后续 prompt 必须被隔离**立即**拒绝。反例实现会放行它：新 worker 起来后照样
+    # 卡在 30s 阻塞里，于是这里读不到响应——超时本身就是「放行了新 turn」的证据。
+    rid2 = p.send("session/prompt", {"sessionId": session_id, "prompt": [{"type": "text", "text": "第二问"}]})
+    try:
+        second = p.await_response(rid2, timeout=15)
+    except AssertionError as exc:  # pragma: no cover - 仅在反例实现下命中
+        raise AssertionError(
+            "未确认回收后仍放行了新 turn：第二个 prompt 起了新 worker 并卡在后端阻塞里，"
+            f"未收到 -32012（原始失败：{exc}）"
+        ) from None
+    assert second["error"]["code"] == -32012, f"未确认回收后仍放行了新 turn：{second}"
+    assert second["error"]["data"]["sessionId"] == session_id
+    # 不回显 pgid：进程号对客户端无可操作价值
+    assert str(worker_pgid) not in json.dumps(second, ensure_ascii=False)
+
+    # resume 同样拒绝——否则「resume 拉回同一 thread_id 再 prompt」就能绕过隔离
+    rid3 = p.send("session/resume", {"cwd": "/tmp", "sessionId": session_id, "mcpServers": []})
+    assert p.await_response(rid3, timeout=30)["error"]["code"] == -32012
+
+    # 隔离只针对被污染的 thread：新会话必须照常可用，不得被 -32012 连坐。
+    # 脚本仍是 30s 阻塞，因此这一轮同样用取消收敛，判据是「不是隔离错误」。
+    fresh = p.new_session()
+    assert fresh != session_id
+    rid4 = p.send("session/prompt", {"sessionId": fresh, "prompt": [{"type": "text", "text": "新会话"}]})
+    p.send("session/cancel", {"sessionId": fresh}, notification=True)
+    fourth = p.await_response(rid4, timeout=40)
+    assert "error" not in fourth, f"隔离连坐到了新会话：{fourth.get('error')}"
+    assert fourth["result"]["stopReason"] == "cancelled"
+
+    p.proc.kill()
+    p.proc.wait(timeout=5)

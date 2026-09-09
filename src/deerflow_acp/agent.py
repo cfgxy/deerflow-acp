@@ -37,6 +37,7 @@ from .sanitize import describe_exception, redact_text
 from .session import (
     Session,
     SessionIdError,
+    SessionQuarantinedError,
     SessionRegistry,
     TurnAlreadyRunningError,
     UnknownSessionError,
@@ -53,6 +54,9 @@ AGENT_TITLE = "DeerFlow ACP Bridge"
 ERROR_UNKNOWN_SESSION = -32001
 ERROR_BACKEND_UNAVAILABLE = -32010
 ERROR_TURN_IN_PROGRESS = -32011
+#: 会话被隔离：上一轮 worker 进程组未确认终结，不允许在同一 thread 上继续。
+#: 与「后端故障」严格分开——这是桥主动拒绝并发写 checkpoint，后端本身可能好着。
+ERROR_SESSION_QUARANTINED = -32012
 
 
 def _text_from_prompt(blocks: list[Any]) -> str:
@@ -97,6 +101,22 @@ def _error_type_name(exc: BaseException) -> str:
     if isinstance(exc, RemoteBackendError):
         return exc.error_class
     return type(exc).__name__
+
+
+def _quarantine_error(session_id: str) -> RequestError:
+    """会话被隔离时给客户端的错误。
+
+    不回显 pgid：进程号对客户端没有可操作价值，运维信息留在 stderr 日志里。
+    hint 必须明确「换新会话」，否则客户端会一直重试同一个 sessionId。
+    """
+    return RequestError(
+        ERROR_SESSION_QUARANTINED,
+        "该会话已被隔离：上一轮执行体未能确认终结",
+        {
+            "sessionId": session_id,
+            "hint": "为避免与残留执行体并发写同一条对话历史，请用 session/new 开启新会话",
+        },
+    )
 
 
 class DeerFlowAgent:
@@ -210,6 +230,8 @@ class DeerFlowAgent:
     async def prompt(self, prompt: list[Any], session_id: str, **kwargs: Any) -> PromptResponse:
         try:
             session = self._sessions.get(session_id)
+        except SessionQuarantinedError:
+            raise _quarantine_error(session_id) from None
         except UnknownSessionError:
             raise RequestError(
                 ERROR_UNKNOWN_SESSION,
@@ -226,6 +248,9 @@ class DeerFlowAgent:
 
         try:
             outcome = await self._sessions.run_turn(session, message, on_event)
+        except SessionQuarantinedError:
+            # 两处都要拦：进入前（上一轮留下的隔离）与本轮收尾时新置的隔离。
+            raise _quarantine_error(session_id) from None
         except TurnAlreadyRunningError:
             raise RequestError(
                 ERROR_TURN_IN_PROGRESS,
@@ -331,6 +356,10 @@ class DeerFlowAgent:
             raise RequestError.invalid_params({"reason": str(exc), "sessionId": session_id}) from None
         try:
             return self._sessions.resume(session_id, cwd)
+        except SessionQuarantinedError:
+            # 隔离必须在 resume 这一层就拦住：注册项已被摘掉，只靠 prompt 拦不住
+            # 「resume 拉回同一个 thread_id 再发 prompt」这条绕行路径。
+            raise _quarantine_error(session_id) from None
         except UnknownSessionError:
             raise RequestError(
                 ERROR_UNKNOWN_SESSION,
@@ -415,6 +444,7 @@ def build_agent(
 __all__ = [
     "AGENT_NAME",
     "ERROR_BACKEND_UNAVAILABLE",
+    "ERROR_SESSION_QUARANTINED",
     "ERROR_TURN_IN_PROGRESS",
     "ERROR_UNKNOWN_SESSION",
     "DeerFlowAgent",

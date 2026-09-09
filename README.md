@@ -34,6 +34,8 @@ flowchart LR
 | 会话恢复 | 以 `DeerFlowClient.get_thread()` 是否返回 checkpoint 为唯一依据；不存在则报错，绝不静默新建 |
 | 取消 | 协作式优先：`session/cancel` → 向 worker 进程组发 `SIGTERM`，worker 在下一个 yield 边界 `generator.close()`。宽限期由**事件循环侧**计时，因此后端即使卡在 yield **之前**（模型/工具调用还没返回），`session/prompt` 仍在宽限期内返回 `cancelled`；超时则 `killpg(SIGKILL)` 终止**整个进程组**（连带 DeerFlow 派生的工具子进程），并**等到进程确认退出后才释放 session**——旧 worker 不可能与下一个 turn 并发写同一条 thread |
 | 进程隔离 | 每 turn 一个独立进程组的 worker 子进程；强杀后同 session 从 DeerFlow checkpoint 继续，不丢上下文 |
+| 释放判据 | 释放 session 的条件是**整个进程组已排空**，不是「worker 主 PID 已退出」。DeerFlow 的工具可以派生留在同一 PGID 里的孙进程，它们不是桥的子进程、`waitpid` 看不到，只能靠 `killpg(pgid, 0)` 探活。所有退出路径（正常、协作取消、强杀、事件下发异常）统一先回收主进程再轮询到整组消失 |
+| 会话隔离 | 无法确认进程组排空时，该 session **不可逆**隔离：后续 `prompt`/`resume`/`load` 返回 `-32012`，客户端需 `session/new`。pgid 仍留在在途集合里由关停兜底继续回收。`session/close` 若落在 turn 运行中则延后生效，堵住「close → resume → 新 prompt」的并发写窗口 |
 | 孤儿回收 | 双闸：turn 协程被中断时同步 `killpg`；关停路径在宽限期后再兜底 `terminate_all_workers()`。stdin EOF、`SIGINT`/`SIGTERM`、异常退出三条路径都不留桥创建的孤儿进程 |
 | stdout 纪律 | **两层** fd 隔离。桥进程与 worker 进程各自 `dup(1)` 出通道专用 fd 后 `dup2(2, 1)`：任何 `print`（含 C 扩展裸 `write`）物理上无法污染 JSON-RPC 流或 ndJSON IPC 流 |
 | 跨进程错误 | worker 侧异常**只把类型名**送过 IPC 边界：消息、`args`、`__cause__`、traceback 一律不过河。凭据即使被某个 SDK 塞进异常消息也不可能到达桥进程 |

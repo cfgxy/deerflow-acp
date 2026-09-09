@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import sys
 import time
 from collections.abc import Iterator
@@ -38,8 +39,14 @@ class StatefulFakeBackend:
           "stall_before_first_yield_s": 0,   # 第一个 yield 之前阻塞（模拟卡在模型调用里）
           "side_effect_interval_s": 0.2,     # 阻塞期间每隔多久写一次副作用
           "raise": "RuntimeError: ...",      # stream 立即抛该异常
-          "raise_on_close": "..."            # 生成器 close() 时抛该异常（消息含假秘密）
+          "raise_on_close": "...",           # 生成器 close() 时抛该异常（消息含假秘密）
+          "tool_child_lifetime_s": 0         # 派生一个「工具子进程」，活这么久后自己退出
         }
+
+    ``tool_child_lifetime_s`` 模拟 DeerFlow 的工具派生出的孙进程：它留在 worker
+    的**同一个进程组**里，但**不是**桥的子进程，因此 ``proc.wait()`` 看不到它。
+    worker 主进程先退出、这个孙进程还在跑，正是「主 PID 退出 ≠ 进程组排空」的
+    真实形态；它持续写副作用，让「会话被提前释放」变成可观测的物证。
     """
 
     def __init__(self, config: Any) -> None:
@@ -52,6 +59,7 @@ class StatefulFakeBackend:
         self._raise = self._script.get("raise")
         self._raise_on_close = self._script.get("raise_on_close")
         self._checkpoint_interval = float(self._script.get("checkpoint_interval_s", 0.2))
+        self._tool_child_lifetime = float(self._script.get("tool_child_lifetime_s", 0))
 
     # ------------------------------------------------------------------
 
@@ -62,19 +70,50 @@ class StatefulFakeBackend:
             fh.flush()
 
     def _append_checkpoint(self, thread_id: str) -> None:
-        """模拟 DeerFlow 以 thread_id 为主键写 checkpoint。"""
+        """模拟 DeerFlow 以 thread_id 为主键写 checkpoint。
+
+        写入必须**原子**：这个后端随时会被 SIGKILL 打断，若直接覆写目标文件，
+        强杀落在「截断」与「写入」之间就会留下 0 字节文件，把「旧执行体是否
+        改写了既有 checkpoint」这个观测点毁掉。先写同目录临时文件再 ``os.replace``，
+        保证任何时刻读到的都是某个完整版本。
+        """
         cp_dir = self._dir / "checkpoints"
         cp_dir.mkdir(exist_ok=True)
         path = cp_dir / f"{thread_id}.json"
-        entries = json.loads(path.read_text(encoding="utf-8")) if path.exists() else []
+        raw = path.read_text(encoding="utf-8") if path.exists() else ""
+        entries = json.loads(raw) if raw.strip() else []
         entries.append({"pid": os.getpid(), "ts": time.time()})
-        path.write_text(json.dumps(entries), encoding="utf-8")
+        tmp = cp_dir / f"{thread_id}.{os.getpid()}.tmp"
+        tmp.write_text(json.dumps(entries), encoding="utf-8")
+        os.replace(tmp, path)
 
     # ------------------------------------------------------------------
+
+    def _spawn_tool_child(self) -> int:
+        """派生一个留在同一进程组里的「工具子进程」。
+
+        不传 ``start_new_session``：它必须继承 worker 的 PGID，否则就测不到
+        「主 PID 退出但进程组仍有活口」。它每 50ms 往 ``tool_child.log`` 追加一行，
+        因此「桥是否真的等到进程组排空」在文件里直接可见。
+        """
+        log = self._dir / "tool_child.log"
+        code = (
+            "import os,time,sys\n"
+            f"deadline=time.time()+{self._tool_child_lifetime!r}\n"
+            "while time.time()<deadline:\n"
+            f"    open({str(log)!r},'a').write(f'{{os.getpid()}} {{time.time():.4f}}\\n')\n"
+            "    time.sleep(0.05)\n"
+        )
+        proc = subprocess.Popen([sys.executable, "-c", code], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        (self._dir / "tool_child.pid").write_text(str(proc.pid), encoding="utf-8")
+        return proc.pid
 
     def stream(self, message: str, *, thread_id: str) -> Iterator[tuple[str, dict[str, Any]]]:
         if self._raise:
             raise RuntimeError(self._raise)
+
+        if self._tool_child_lifetime:
+            self._spawn_tool_child()
 
         if self._script.get("pollute_stdout"):
             # 模拟 DeerFlow / LangGraph / C 扩展往 fd 1 打东西。

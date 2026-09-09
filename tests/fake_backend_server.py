@@ -130,6 +130,16 @@ def main() -> int:
     if os.environ.get("DEERFLOW_ACP_FAKE_USE_WORKER"):
         from deerflow_acp.runner import SubprocessTurnRunner
 
+        if os.environ.get("DEERFLOW_ACP_FAKE_FORCE_UNREAPED"):
+            # 只属于测试夹具的故障注入：模拟「SIGKILL 之后仍无法确认进程组排空」。
+            # 真实环境里这由内核决定（不可杀的 D 状态、无权限的组成员等），
+            # 无法从外部可靠构造，因此在这一层把「确认」强制判为失败，
+            # 让隔离语义（-32012）能在真实 JSON-RPC 上被观测。
+            async def _never_confirm(self, proc, pgid, timeout=None):  # type: ignore[no-untyped-def]
+                return False
+
+            SubprocessTurnRunner._await_group_gone = _never_confirm  # type: ignore[method-assign]
+
         runner = SubprocessTurnRunner(config)
 
     protocol_stdout = isolate_stdout()

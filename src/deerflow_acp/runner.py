@@ -43,6 +43,14 @@ _CANCEL_POLL_SECONDS = 0.05
 #: 给出上限只是为了绝不无限等待。
 _REAP_TIMEOUT_SECONDS = 10.0
 
+#: 确认「整个进程组」消失时的轮询间隔。worker 主进程退出 ≠ 进程组空了：
+#: DeerFlow 的工具可能派生出仍在同一 PGID 里跑的子进程，它们不是我们的子进程，
+#: 无法 ``wait()``，只能用 ``killpg(pgid, 0)`` 探活。
+_GROUP_POLL_SECONDS = 0.02
+
+#: 等待进程组彻底排空的时限。超时即判定「未确认回收」，由会话层隔离该 session。
+_GROUP_DRAIN_TIMEOUT_SECONDS = 5.0
+
 _SENTINEL_DONE = object()
 
 
@@ -112,6 +120,17 @@ class SubprocessTurnRunner:
         #: 在途 worker 的进程组，供关停时兜底回收。协程内的 finally 覆盖不了
         #: 「事件循环整体被拆掉」这种关停形态，必须有一个进程级的收尾入口。
         self._live_pgids: set[int] = set()
+        #: 未能确认终结的进程组，按 session_id 记录。会话层据此隔离该 session：
+        #: 只要旧进程组里还可能有活着的进程，就绝不允许同一 thread_id 上再开 turn。
+        #: 这些 pgid **不从** ``_live_pgids`` 移除——关停兜底还要继续尝试收它们。
+        self._unreaped: dict[str, int] = {}
+
+    def take_unreaped(self, session_id: str) -> int | None:
+        """取出并清除某 session 的「未确认终结」记录。
+
+        会话层在 turn 收尾时调用。返回非 None 即表示该 session 必须被隔离。
+        """
+        return self._unreaped.pop(session_id, None)
 
     def terminate_all(self) -> list[int]:
         """强制终止所有在途 worker 进程组，返回被处理的 pgid。
@@ -250,14 +269,33 @@ class SubprocessTurnRunner:
                 elif kind == ipc.MSG_ERROR:
                     result.error = self._to_error(str(message_obj.get("cls") or "UnknownError"))
                     break
-        except BaseException:
-            # 本协程被取消（桥收到 SIGINT/SIGTERM 后 cancel 在途 turn）或异常退出时，
-            # 绝不能带着活着的 worker 离开——那就是孤儿进程。这里必须用**同步**的
-            # killpg：`await` 在取消传播期间可能再次被打断，同步系统调用不会。
-            # 回收由即将退出的父进程或 init 完成，此处不再等待。
+        except BaseException as exc:
+            # 本协程被取消（桥收到 SIGINT/SIGTERM 后 cancel 在途 turn），或事件下发
+            # （``on_event`` → ``session/update``）抛异常时，绝不能带着活着的 worker
+            # 离开——那就是孤儿进程。这里必须先用**同步**的 killpg：`await` 在取消
+            # 传播期间可能再次被打断，同步系统调用不会。
             self._signal_group(pgid, signal.SIGKILL, session_id)
-            self._live_pgids.discard(pgid)
-            logger.warning("会话 %s：turn 协程被中断，已强制终止 worker 进程组 %s", session_id, pgid)
+
+            confirmed = False
+            if not isinstance(exc, asyncio.CancelledError):
+                # 非取消路径（典型是 on_event 抛错）：事件循环仍在正常运转，
+                # 因此**必须**在这里确认整个进程组已排空再把异常抛上去。
+                # 否则会话被释放、工具子进程却还在跑，与主线验收直接冲突。
+                with contextlib.suppress(Exception):
+                    confirmed = await self._await_group_gone(proc, pgid)
+
+            if confirmed:
+                self._live_pgids.discard(pgid)
+                logger.warning("会话 %s：turn 中断，worker 进程组 %s 已强制终止并确认排空", session_id, pgid)
+            else:
+                # 无法确认（协程正在被取消，或排空超时）：**保留** pgid，让关停兜底
+                # 继续尝试回收；同时登记 unreaped，由会话层隔离该 session。
+                self._unreaped[session_id] = pgid
+                logger.error(
+                    "会话 %s：turn 中断后无法确认 worker 进程组 %s 已排空，该会话将被隔离",
+                    session_id,
+                    pgid,
+                )
             raise
         finally:
             if reader is not None and not reader.done():
@@ -266,9 +304,13 @@ class SubprocessTurnRunner:
                     await reader
 
         killed, reaped = await self._shutdown(proc, pgid, session_id, escalated=result.escalated)
-        self._live_pgids.discard(pgid)
         result.worker_killed = killed
         result.worker_reaped = reaped
+        if reaped:
+            self._live_pgids.discard(pgid)
+        else:
+            # 同上：不摘 pgid，关停兜底还要再收一次；会话层据此隔离 session。
+            self._unreaped[session_id] = pgid
         if cancel_event.is_set():
             result.cancelled = True
         return result
@@ -294,6 +336,52 @@ class SubprocessTurnRunner:
             return False
         return True
 
+    @staticmethod
+    def _group_alive(pgid: int) -> bool:
+        """进程组里是否还有存活进程。
+
+        ``killpg(pgid, 0)`` 是唯一可用的探针：组内的工具子进程不是桥的子进程，
+        ``waitpid`` 对它们无效，只有信号 0 能问出「这个组还在不在」。
+        ``PermissionError`` 说明组内还有进程（只是我们无权发信号），按存活处理——
+        宁可判定「未确认」也不能误报「已排空」。
+        """
+        try:
+            os.killpg(pgid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        return True
+
+    async def _await_group_gone(
+        self,
+        proc: asyncio.subprocess.Process,
+        pgid: int,
+        timeout: float = _GROUP_DRAIN_TIMEOUT_SECONDS,
+    ) -> bool:
+        """等到**整个进程组**排空，返回是否确认排空。
+
+        两步都必需：
+        1. ``proc.wait()`` 回收 worker 主进程——它是我们的子进程，不 wait 会留僵尸，
+           而僵尸会让 ``killpg(pgid, 0)`` 永远报「组还活着」。
+        2. 轮询 ``killpg(pgid, 0)``，直到组内再无进程。**worker 主进程退出不等于
+           进程组空了**：DeerFlow 的工具可以派生仍在同一 PGID 里的子进程，它们
+           继续执行副作用、继续写同一条 thread。
+        """
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+
+        if proc.returncode is None:
+            with contextlib.suppress(asyncio.TimeoutError):
+                await asyncio.wait_for(proc.wait(), timeout=max(0.0, deadline - loop.time()))
+
+        while loop.time() < deadline:
+            if not self._group_alive(pgid):
+                return True
+            await asyncio.sleep(_GROUP_POLL_SECONDS)
+
+        return not self._group_alive(pgid)
+
     async def _shutdown(
         self,
         proc: asyncio.subprocess.Process,
@@ -302,28 +390,34 @@ class SubprocessTurnRunner:
         *,
         escalated: bool,
     ) -> tuple[bool, bool]:
-        """确保 worker 进程组彻底退出，返回 ``(是否强杀, 是否确认回收)``。
+        """确保 worker **进程组**彻底排空，返回 ``(是否强杀, 是否确认回收)``。
 
-        **这里必须等到进程真的死掉才返回**：调用方随后就会释放 ``_running``，
-        允许下一个 turn 在同一 DeerFlow ``thread_id`` 上启动。只要旧 worker 还活着，
-        两者就会并发写同一条 thread 的 checkpoint，并可能继续执行工具副作用。
+        **这里必须等到整个进程组真的空了才返回 True**：调用方随后就会释放
+        ``_running``，允许下一个 turn 在同一 DeerFlow ``thread_id`` 上启动。只要
+        组内还有任何进程活着，它就可能继续执行工具副作用、继续写同一条 thread
+        的 checkpoint。因此判据是「组已排空」，不是「主 PID 已退出」——后者在
+        工具派生子进程的情况下会漏掉一整棵进程树。
         """
-        if proc.returncode is not None:
-            return False, True
-
         if not escalated:
             # 正常/协作结束：worker 已写完 IPC 通道，给它一点时间自行退出。
             with contextlib.suppress(asyncio.TimeoutError):
                 await asyncio.wait_for(proc.wait(), timeout=_CANCEL_POLL_SECONDS * 20)
-            if proc.returncode is not None:
+            if proc.returncode is not None and not self._group_alive(pgid):
+                # 主进程已退出且组已排空，这才是真正的干净结束。
                 return False, True
+            if proc.returncode is not None:
+                logger.warning(
+                    "会话 %s：worker %s 已退出但进程组 %s 内仍有进程存活，强制回收整组",
+                    session_id,
+                    proc.pid,
+                    pgid,
+                )
 
         self._signal_group(pgid, signal.SIGKILL, session_id)
-        try:
-            await asyncio.wait_for(proc.wait(), timeout=_REAP_TIMEOUT_SECONDS)
-        except asyncio.TimeoutError:
+        drained = await self._await_group_gone(proc, pgid, timeout=_REAP_TIMEOUT_SECONDS)
+        if not drained:
             logger.error(
-                "会话 %s：worker %s（进程组 %s）在 SIGKILL 后 %.1fs 内仍未被回收",
+                "会话 %s：worker %s 的进程组 %s 在 SIGKILL 后 %.1fs 内仍未排空",
                 session_id,
                 proc.pid,
                 pgid,
@@ -332,11 +426,10 @@ class SubprocessTurnRunner:
             return True, False
 
         logger.warning(
-            "会话 %s：worker %s（进程组 %s）未在 %s 内协作退出，已强制终止整个进程组",
+            "会话 %s：worker %s（进程组 %s）未在宽限期内协作退出，已强制终止整个进程组并确认排空",
             session_id,
             proc.pid,
             pgid,
-            "宽限期",
         )
         return True, True
 

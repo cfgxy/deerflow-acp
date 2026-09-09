@@ -37,7 +37,7 @@ DeerFlow harness **不在** `dependencies` 中。它不在任何公开索引上�
 | `session/resume` | 支持（unstable） | 恢复会话，**不重放**——Multica 客户端已持有本地记录，重放会造成 UI 重复 |
 | `session/prompt` | 支持 | 仅接受 `text` 内容块 |
 | `session/cancel` | 支持 | 通知型。先向 worker 进程组发 `SIGTERM` 请求协作退出，宽限期超时后 `killpg(SIGKILL)`；未知 sessionId 静默忽略（无响应通道） |
-| `session/close` | 支持（unstable） | 释放注册表条目，DeerFlow checkpoint 保留 |
+| `session/close` | 支持（unstable） | 释放注册表条目，DeerFlow checkpoint 保留。**turn 在跑时延后生效**：只置取消标志，等在途 turn 确认 worker 进程组终结后才摘除条目（见「同 session 生命周期」） |
 | `authenticate` | **不支持** | `-32601`。凭据由 DeerFlow 本地机制注入，桥不参与认证 |
 | `session/set_mode` | **不支持** | `-32601` |
 | `session/set_model` | **不支持** | `-32601`。模型经 `DEERFLOW_ACP_MODEL` 在启动时固定 |
@@ -60,6 +60,7 @@ Multica 的续会话请求会直接收到 `-32601`。这是硬需求，不是可
 | `-32001` | Unknown session | sessionId 在本进程与 DeerFlow checkpointer 中都不存在 |
 | `-32010` | Backend unavailable | `DeerFlowClient` 构造失败或 checkpointer 读取异常 |
 | `-32011` | Turn in progress | 同一 session 上已有 turn 在跑 |
+| `-32012` | Session quarantined | 上一轮的 worker 进程组未能确认终结，该 session 被**永久**隔离。`session/prompt`、`session/resume`、`session/load` 一律拒绝，`data` 只含 `sessionId` 与「请用 `session/new`」提示，**不回显 pgid**。与 `-32010` 严格分开：后端可能好着，这是桥主动拒绝并发写同一条 checkpoint |
 | `-32603` | Internal error | turn 执行失败。**响应体只含 `sessionId` 与 `errorType`**，不含 message、traceback 或配置内容 |
 
 「未知会话」与「后端故障」严格分账：checkpointer 自身报错不得伪装成
@@ -149,12 +150,31 @@ ACP `usage_update` 的 `size` / `used` 表示**上下文窗口占用**；DeerFlo
 | stdin EOF | 退出码 0；在途 worker 进程组被强制回收后才退出 |
 | `SIGINT` / `SIGTERM` | 先给活跃会话置取消标志，宽限 `SHUTDOWN_GRACE_SECONDS`；超时后取消在途 turn 协程并强制回收所有在途 worker 进程组 |
 | 孤儿进程 | 双闸冗余：① turn 协程被中断时在 `except BaseException` 内**同步** `killpg`（`await` 在取消传播期间可能再被打断，同步系统调用不会）；② 关停路径再调 `terminate_all_workers()` 兜底。两闸互为冗余——缺任一仍不产生孤儿，同时缺失才会漏 |
+| 释放判据 | **进程组已排空**，不是「主 PID 已退出」。DeerFlow 的工具可以派生留在同一 PGID 里的孙进程；它们不是桥的子进程，`waitpid` 看不到，只能用 `killpg(pgid, 0)` 探活（`PermissionError` 按存活处理）。任何退出路径——正常结束、协作取消、强杀、事件下发异常——都必须先回收 worker 主进程（否则僵尸会让探针永远报「组还活着」）再轮询到整组消失，才允许释放 session |
+
+## 同 session 生命周期
+
+同一 DeerFlow `thread_id` 上**绝不允许两个执行体并存**：它们会并发写同一条
+checkpoint。桥用一条不变式守住这点：
+
+> **只有确认整个 worker 进程组终结，才释放 session；无法确认时隔离该 session。**
+
+由此派生三条对客户端可见的行为：
+
+| 情形 | 行为 |
+| --- | --- |
+| turn 运行中收到 `session/close` | 只置取消标志并记下「关闭已请求」，**不立即摘除注册项**。ACP SDK 并发分发 request 与 notification，客户端可以在 close 之后立刻 `session/resume` 拉回同一 `thread_id` 再发 prompt；若此时条目已消失，`_running` 就查不到了，新旧 worker 会在取消宽限期内并发写同一条 checkpoint。因此这期间 `resume` 拿回的仍是那个在跑的会话，第二个 `prompt` 返回 `-32011`；turn 确认终结后 close 才真正生效 |
+| 进程组无法确认排空（`SIGKILL` 后仍未排空、或协程正被取消而无法 `await` 确认） | 该 session **不可逆**隔离：`prompt` / `resume` / `load` 全部返回 `-32012`。桥无法证明一个失控进程组已经消失，唯一安全做法是永久拒绝在这条 thread 上再开 turn。客户端应改用 `session/new` |
+| 隔离后的 pgid | **保留**在在途集合中，关停兜底（`terminate_all_workers()`）仍会继续尝试回收。隔离是拒绝新 turn，不是放弃回收 |
+
+隔离只针对被污染的 `thread_id`，不连坐其他会话。
 
 ## 已知限制
 
 1. **历史重放不含工具调用**。`session/load` 只重放 human / ai 文本消息，tool 与
    system 消息跳过——ACP 没有无损表达历史工具调用的形态，跳过好过伪造。
-2. **同一 session 不支持并发 turn**。第二个 `session/prompt` 返回 `-32011`。
+2. **同一 session 不支持并发 turn**。第二个 `session/prompt` 返回 `-32011`；
+   `session/close` 落在 turn 运行中时延后生效，见「同 session 生命周期」。
 3. **模型在进程生命周期内固定**。`session/set_model` 不支持，换模型需重启桥。
 4. **`session/fork` 不支持**。DeerFlow checkpointer 无对应语义。
 5. **凭据完全交给 DeerFlow**。桥不读、不存、不转发任何 API key。
@@ -169,7 +189,13 @@ ACP `usage_update` 的 `size` / `used` 表示**上下文窗口占用**；DeerFlo
    继续且不与旧 worker 并发」，不是「不丢任何 token」。
 9. **每 turn 一次进程启动开销**。worker 需重新 import DeerFlow 与模型 SDK，
    首个事件前有固定延迟。这是换取可终止性的代价，属已知设计取舍。
-10. **`InProcessTurnRunner` 没有强制终止能力**。它只服务于把后端对象直接注入
+10. **主动 `setsid()` 的工具进程能逃出 PGID**。桥的回收单位是 worker 的进程组；
+    若某个工具自己新建会话或把作业交给外部服务管理器（systemd 等），它就不在
+    这个组里，`killpg` 收不到。这是已登记的边界，不在当前验收范围内。
+11. **隔离不可逆**。一旦某 session 因「进程组未确认排空」被隔离，桥不会再自动
+    解除——它无法证明失控进程组已经消失。客户端必须 `session/new`；旧
+    checkpoint 仍在 DeerFlow 侧，但桥不再在这条 thread 上开 turn。
+12. **`InProcessTurnRunner` 没有强制终止能力**。它只服务于把后端对象直接注入
     的单元测试（Python 对象跨不过进程边界）；宽限期超时后只能弃用工作线程。
     **它不在生产路径上**——`deerflow-acp acp` 一律使用 `SubprocessTurnRunner`。
 
@@ -181,6 +207,7 @@ ACP `usage_update` 的 `size` / `used` 表示**上下文窗口占用**；DeerFlo
 | --- | --- | --- |
 | 1 | 单个 turn 失败 | 客户端收到 `-32603`（脱敏）或 `refusal`；session 仍可用，重发 prompt |
 | 2 | 会话状态异常 | `session/close` 后 `session/new`；DeerFlow checkpoint 不受影响 |
+| 2 | 会话被隔离（`-32012`） | 只能 `session/new`。原 checkpoint 仍在 DeerFlow 侧，但桥不再在该 `thread_id` 上开 turn；若需要那段历史，用新会话读取或在 DeerFlow 侧处理 |
 | 3 | 桥进程异常 | 重启进程后 `session/resume` 原 sessionId；checkpoint 在 DeerFlow 侧持久化，跨进程可恢复 |
 | 4 | 桥整体不可用 | Multica 侧改回直连 DeerFlow HTTP 接口（`http://127.0.0.1:2026`）；桥是旁路组件，不修改 DeerFlow 任何代码或数据 |
 

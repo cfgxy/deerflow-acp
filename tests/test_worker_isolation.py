@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import copy
 import json
 import os
 import signal
@@ -20,12 +21,13 @@ import threading
 import time
 from pathlib import Path
 from typing import Any
+from unittest import mock
 
 import pytest
 
 from deerflow_acp.config import BridgeConfig
 from deerflow_acp.runner import RemoteBackendError, SubprocessTurnRunner
-from deerflow_acp.session import SessionRegistry
+from deerflow_acp.session import SessionQuarantinedError, SessionRegistry, TurnAlreadyRunningError
 
 REPO_TESTS = Path(__file__).parent
 
@@ -71,7 +73,16 @@ def checkpoint_writers(state: Path, thread_id: str) -> set[int]:
     path = state / "checkpoints" / f"{thread_id}.json"
     if not path.exists():
         return set()
-    return {entry["pid"] for entry in json.loads(path.read_text(encoding="utf-8"))}
+    raw = path.read_text(encoding="utf-8")
+    if not raw.strip():
+        # worker 正好在 write_text 中途被强杀，文件被截断。这是「强制终止真的
+        # 发生了」的副产品，不是被测行为的缺陷；按「没有可辨认的写入者」处理。
+        return set()
+    try:
+        entries = json.loads(raw)
+    except json.JSONDecodeError:
+        return set()
+    return {entry["pid"] for entry in entries}
 
 
 def pgid_alive(pgid: int) -> bool:
@@ -273,16 +284,23 @@ async def test_session_reuses_checkpoint_after_kill(state: Path):
     first = await asyncio.wait_for(task, timeout=20)
     assert first.worker_killed is True
 
-    before = len(json.loads((state / "checkpoints" / f"{thread_id}.json").read_text(encoding="utf-8")))
-    assert before > 0, "强杀前应已落下 checkpoint"
+    cp_path = state / "checkpoints" / f"{thread_id}.json"
+    existing = json.loads(cp_path.read_text(encoding="utf-8"))
+    assert existing, "强杀前应已落下 checkpoint"
+    # 快照真实内容，而不是把切片和它自己的 JSON round-trip 比——后者对任何输入都成立，
+    # 无法证明「既有条目未被改写」。
+    snapshot = copy.deepcopy(existing)
 
     write_script(state, {"stall_before_first_yield_s": 0, "events": [["end", {"usage": {}}]]})
     second = await asyncio.wait_for(reg.run_turn(session, "第二问", _noop), timeout=30)
     assert second.stop_reason == "end_turn"
 
-    after = json.loads((state / "checkpoints" / f"{thread_id}.json").read_text(encoding="utf-8"))
-    assert len(after) > before, "新 turn 必须在同一 thread 的既有 checkpoint 上继续追加"
-    assert after[:before] == json.loads(json.dumps(after[:before])), "既有 checkpoint 不得被破坏"
+    after = json.loads(cp_path.read_text(encoding="utf-8"))
+    assert len(after) > len(snapshot), "新 turn 必须在同一 thread 的既有 checkpoint 上继续追加"
+    assert after[: len(snapshot)] == snapshot, "既有 checkpoint 前缀被改写了"
+    assert all(entry["pid"] == second.worker_pid for entry in after[len(snapshot) :]), (
+        "新追加的 checkpoint 必须全部来自新 worker"
+    )
 
 
 # ----------------------------------------------------------------------
@@ -409,10 +427,14 @@ async def test_worker_process_group_is_reaped_on_every_path(state: Path):
 
 @pytest.mark.asyncio
 async def test_terminate_all_reaps_in_flight_worker(state: Path):
-    """关停兜底：turn 协程被取消后，``terminate_all`` 必须收掉在途 worker。
+    """关停兜底：``terminate_all`` 必须能独立收掉在途 worker。
 
     模拟桥收到 SIGTERM——事件循环侧直接 cancel 在途 turn，此时没有任何
     session/cancel 走过取消流程，回收只能靠这个进程级入口。
+
+    **本用例刻意屏蔽协程内的中断强杀分支**（`_signal_group` 打桩成 no-op）：
+    否则 worker 早就被那一路收掉了，`terminate_all` 即使完全失效也照样通过，
+    用例就失去了对兜底闸的区分力。
     """
     write_script(state, {"events": [], "stall_before_first_yield_s": 30, "side_effect_interval_s": 0.1})
     runner = ScriptedSubprocessRunner(BridgeConfig(cancel_grace_seconds=5.0), state)
@@ -432,19 +454,228 @@ async def test_terminate_all_reaps_in_flight_worker(state: Path):
         await asyncio.sleep(0.05)
     assert side_effect_count(state) > 0, "worker 没有起来"
 
-    task.cancel()
-    with contextlib.suppress(asyncio.CancelledError):
-        await task
+    real_signal_group = SubprocessTurnRunner._signal_group
+    with mock.patch.object(SubprocessTurnRunner, "_signal_group", staticmethod(lambda *a, **k: True)):
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+        # 前置条件：中断分支被屏蔽后 worker 确实还活着，兜底闸才有可测对象
+        pgid = next(iter(runner._live_pgids), None)
+        assert pgid is not None, "在途 pgid 必须仍被 runner 持有，否则兜底闸无从生效"
+        assert real_signal_group(pgid, 0, "df-x") is True, "worker 应仍存活，否则本用例无区分力"
 
-    # 协程内的中断分支已经强杀过；terminate_all 是幂等的第二道闸
     reaped = runner.terminate_all()
+    assert pgid in reaped, "terminate_all 必须处理仍在途的进程组"
     await asyncio.sleep(0.3)
-    for pgid in reaped:
-        assert not pgid_alive(pgid)
+    assert not pgid_alive(pgid)
 
     before = side_effect_count(state)
     await asyncio.sleep(1.0)
     assert side_effect_count(state) == before, "worker 在关停后仍在制造副作用"
+
+
+# ----------------------------------------------------------------------
+# 6) 阻断项返工：任何退出路径都必须确认**整个进程组**终结后才释放 session
+# ----------------------------------------------------------------------
+
+
+async def _start_stalled_turn(reg: SessionRegistry, session: Any, state: Path) -> asyncio.Task:
+    """起一个卡在第一个 yield 之前的 turn，并等到它真的在跑。"""
+    task = asyncio.create_task(reg.run_turn(session, "问题", _noop))
+    deadline = time.time() + 15
+    while side_effect_count(state) == 0 and time.time() < deadline:
+        await asyncio.sleep(0.05)
+    assert side_effect_count(state) > 0, "worker 没有起来"
+    return task
+
+
+async def test_close_during_turn_does_not_allow_resume_before_worker_dies(state: Path):
+    """`session/close` 在 turn 运行中不得立即摘除注册项。
+
+    反例形态：close 一进来就 pop，客户端随即 `session/resume` 拉回同一个 thread_id
+    并发新 prompt——旧 worker 还在宽限期里，两个 worker 会并发写同一条 checkpoint。
+    这里断言 resume 在旧执行体终结前拿不到一个可用的新会话。
+    """
+    write_script(
+        state,
+        {"stall_before_first_yield_s": 20, "side_effect_interval_s": 0.1, "events": [["end", {"usage": {}}]]},
+    )
+    reg = registry(state, cancel_grace_seconds=3.0)
+    session = reg.create("/tmp")
+    thread_id = session.session_id
+
+    task = await _start_stalled_turn(reg, session, state)
+
+    # close 到达：只置取消标志 + 记下关闭请求，注册项必须还在
+    reg.close(thread_id)
+    assert reg._sessions.get(thread_id) is session, "turn 在跑时 close 不得摘除注册项"
+    assert session.running is True
+
+    # 客户端立刻 resume 回来：拿到的必须是同一个仍在运行的 session，
+    # 因此新 prompt 只能得到 TurnAlreadyRunningError，不可能起第二个 worker。
+    resumed = reg.resume(thread_id, "/tmp")
+    assert resumed is session
+    with pytest.raises(TurnAlreadyRunningError):
+        await reg.run_turn(resumed, "抢跑的第二问", _noop)
+
+    outcome = await asyncio.wait_for(task, timeout=30)
+    assert outcome.worker_pgid is not None
+    assert not pgid_alive(outcome.worker_pgid)
+    # 旧执行体确认终结后，延后的 close 才真正生效
+    assert thread_id not in reg._sessions, "在途 turn 结束后 close 请求必须生效"
+    # 全程只有一个 worker 写过这条 thread
+    assert checkpoint_writers(state, thread_id) <= {outcome.worker_pid}
+
+
+async def test_session_not_released_until_tool_child_in_group_exits(state: Path):
+    """worker 主进程先退出、组内工具子进程仍存活时，session 不得被释放。
+
+    反例形态：把「主 PID 退出」当成「进程组退出」。这里的工具子进程留在同一
+    PGID 里但不是桥的子进程，``proc.wait()`` 根本看不到它；只有 ``killpg(pgid, 0)``
+    才问得出真相。它持续写 ``tool_child.log``，因此提前释放会留下物证。
+    """
+    write_script(
+        state,
+        {
+            "events": [["end", {"usage": {}}]],
+            "tool_child_lifetime_s": 3.0,
+            "side_effect_interval_s": 0.1,
+        },
+    )
+    reg = registry(state, cancel_grace_seconds=5.0)
+    session = reg.create("/tmp")
+
+    outcome = await asyncio.wait_for(reg.run_turn(session, "问题", _noop), timeout=40)
+
+    assert outcome.stop_reason == "end_turn"
+    child_pid = int((state / "tool_child.pid").read_text(encoding="utf-8"))
+    # 前置条件：工具子进程确实被派生出来过，否则本用例无区分力
+    assert child_pid > 0
+    # run_turn 返回时整个进程组必须已排空——包含那个孙进程
+    assert outcome.worker_pgid is not None
+    assert not pgid_alive(outcome.worker_pgid), "run_turn 返回时进程组内仍有存活进程"
+    assert not _pid_alive(child_pid), f"工具子进程 {child_pid} 在 session 释放后仍存活"
+
+    # 且它不再写日志
+    before = _tool_child_lines(state)
+    await asyncio.sleep(1.0)
+    assert _tool_child_lines(state) == before, "组内工具子进程在 session 释放后仍在产生副作用"
+
+
+async def test_session_quarantined_when_group_cannot_be_confirmed_dead(state: Path):
+    """回收无法确认时必须隔离 session，禁止后续 prompt 与 resume。
+
+    反例形态：`worker_reaped=False` 却照样释放 `_running`，下一个 turn 就与可能
+    仍在写 checkpoint 的旧执行体并发。这里把「确认排空」打桩成永远失败，断言
+    桥选择隔离而不是放行。
+    """
+    write_script(
+        state,
+        {"stall_before_first_yield_s": 20, "side_effect_interval_s": 0.1, "events": [["end", {"usage": {}}]]},
+    )
+    reg = registry(state, cancel_grace_seconds=0.4)
+    session = reg.create("/tmp")
+    thread_id = session.session_id
+
+    task = await _start_stalled_turn(reg, session, state)
+
+    async def never_drained(self, proc, pgid, timeout=None):
+        return False
+
+    with mock.patch.object(SubprocessTurnRunner, "_await_group_gone", never_drained):
+        reg.cancel(thread_id)
+        outcome = await asyncio.wait_for(task, timeout=30)
+
+    assert outcome.worker_reaped is False, "前置条件：本轮必须是「未确认回收」"
+    assert session.quarantined is True
+    assert thread_id not in reg._sessions, "被隔离的会话必须从注册表摘除"
+
+    # 三条入口全部拒绝：run_turn、get、resume
+    with pytest.raises(SessionQuarantinedError):
+        await reg.run_turn(session, "第二问", _noop)
+    with pytest.raises(SessionQuarantinedError):
+        reg.get(thread_id)
+    with pytest.raises(SessionQuarantinedError):
+        reg.resume(thread_id, "/tmp")
+
+    # 隔离期间 pgid 仍归 runner 持有，关停兜底还能收它
+    assert outcome.worker_pgid in reg._runner._live_pgids
+    reg.terminate_all_workers()
+    await asyncio.sleep(0.3)
+    assert not pgid_alive(outcome.worker_pgid)
+
+
+async def test_event_dispatch_failure_confirms_group_and_keeps_tracking(state: Path):
+    """`on_event` 抛异常时，必须确认进程组终结，且不丢失回收跟踪。
+
+    反例形态：只同步 killpg 就从 `_live_pgids` 删掉且不确认退出——session 被释放、
+    关停兜底也失去这个 PGID，组内进程无人负责。
+    """
+    write_script(
+        state,
+        {
+            "events": [["messages-tuple", {"type": "ai", "content": "x", "id": "m"}] for _ in range(50)],
+            "side_effect_interval_s": 0.1,
+        },
+    )
+    reg = registry(state, cancel_grace_seconds=5.0)
+    session = reg.create("/tmp")
+    thread_id = session.session_id
+
+    class Boom(RuntimeError):
+        pass
+
+    async def exploding_on_event(event_type: str, data: dict) -> None:
+        raise Boom("下发失败")
+
+    # 记下本轮的 pgid：异常路径没有 TurnOutcome，只能从信号动作里抓。
+    seen_pgids: list[int] = []
+    real_signal_group = SubprocessTurnRunner._signal_group
+
+    def spy(pgid: int, sig: int, session_id: str) -> bool:
+        if sig != 0:
+            seen_pgids.append(pgid)
+        return real_signal_group(pgid, sig, session_id)
+
+    with mock.patch.object(SubprocessTurnRunner, "_signal_group", staticmethod(spy)):
+        with pytest.raises(Boom):
+            await reg.run_turn(session, "问题", exploding_on_event)
+
+    assert seen_pgids, "中断分支必须对进程组发过信号"
+    pgid = seen_pgids[0]
+
+    assert session.running is False
+    # 关键区分点：只发 SIGKILL 不等于组已排空。不 ``proc.wait()`` 的反例实现会把
+    # worker 主进程留成僵尸，而僵尸仍属于该进程组，``killpg(pgid, 0)`` 照样成功——
+    # 也就是说 session 已被释放，组却还没消失。正确实现必须先回收主进程、再轮询到
+    # 整组消失，才允许返回。
+    assert not pgid_alive(pgid), "run_turn 抛出时进程组必须已确认排空（含回收主进程）"
+    # 事件下发失败不是「未确认回收」——事件循环还活着，必须当场确认排空，
+    # 因此 session 不该被隔离，而是干净结束。
+    assert session.quarantined is False, "能确认排空时不应误隔离"
+    assert not reg._runner._live_pgids, "确认排空后应从在途集合摘除"
+    pgids = reg.terminate_all_workers()
+    assert pgids == [], "已确认排空的进程组不应再残留在兜底集合里"
+    # 无残余进程继续写这条 thread
+    writers = checkpoint_writers(state, thread_id)
+    assert len(writers) <= 1
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _tool_child_lines(state: Path) -> int:
+    path = state / "tool_child.log"
+    if not path.exists():
+        return 0
+    return len([line for line in path.read_text(encoding="utf-8").splitlines() if line.strip()])
 
 
 def test_signal_group_tolerates_missing_process():
