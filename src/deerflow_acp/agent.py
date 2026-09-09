@@ -32,6 +32,7 @@ from .backend import BackendUnavailableError, DeerFlowBackend, EmbeddedDeerFlowB
 from .config import BridgeConfig
 from .events import EventNormalizer
 from .logging_setup import get_logger
+from .runner import RemoteBackendError, TurnRunner
 from .sanitize import describe_exception, redact_text
 from .session import (
     Session,
@@ -86,6 +87,18 @@ def _text_from_prompt(blocks: list[Any]) -> str:
     return "\n\n".join(parts)
 
 
+def _error_type_name(exc: BaseException) -> str:
+    """给客户端的错误分类标签。
+
+    worker 子进程里的异常过河时只剩类型名（见 :mod:`deerflow_acp.ipc`），
+    在父进程侧被包成 ``RemoteBackendError``。直接报这个包装类型没有诊断价值，
+    因此还原成 worker 侧的真实类型名。
+    """
+    if isinstance(exc, RemoteBackendError):
+        return exc.error_class
+    return type(exc).__name__
+
+
 class DeerFlowAgent:
     """ACP ``Agent`` 协议实现。"""
 
@@ -95,13 +108,16 @@ class DeerFlowAgent:
         *,
         config: BridgeConfig | None = None,
         backend: DeerFlowBackend | None = None,
+        runner: TurnRunner | None = None,
     ) -> None:
         self._conn = connection
         self._config = config or BridgeConfig.from_env()
         # initialize 阶段不构造 DeerFlowClient：EmbeddedDeerFlowBackend
         # 内部对 client 做懒加载，重型后端只在第一次真正需要时才拉起。
         self._backend = backend or EmbeddedDeerFlowBackend(self._config)
-        self._sessions = SessionRegistry(self._backend, self._config)
+        # runner 只在契约测试里显式给出（脚本化后端 + 真 worker 子进程）；
+        # 生产与单元测试都由 SessionRegistry 按后端类型自行选择。
+        self._sessions = SessionRegistry(self._backend, self._config, runner=runner)
 
     @property
     def registry(self) -> SessionRegistry:
@@ -241,11 +257,27 @@ class DeerFlowAgent:
             raise RequestError(
                 RequestError.internal_error().code,
                 "DeerFlow turn 执行失败",
-                {"sessionId": session_id, "errorType": type(outcome.error).__name__},
+                {"sessionId": session_id, "errorType": _error_type_name(outcome.error)},
             ) from None
 
         if outcome.escalated:
-            logger.warning("会话 %s 取消后后端线程仍在运行，已如实上报", session_id)
+            # 强制终止已在会话层执行并确认；这里只补一条面向运维的可观测记录。
+            # worker_reaped=False 意味着旧执行体可能仍在写同一条 DeerFlow thread，
+            # 属于必须显眼上报的状态，不能与普通升级混为一谈。
+            if outcome.worker_reaped:
+                logger.warning(
+                    "会话 %s 取消超时，worker %s（进程组 %s）已被强制终止并确认回收",
+                    session_id,
+                    outcome.worker_pid,
+                    outcome.worker_pgid,
+                )
+            else:
+                logger.error(
+                    "会话 %s 取消超时，worker %s（进程组 %s）未能确认回收",
+                    session_id,
+                    outcome.worker_pid,
+                    outcome.worker_pgid,
+                )
 
         usage = self._build_usage(outcome.usage_payload)
         if usage is not None and self._config.emit_usage_update:
@@ -375,8 +407,9 @@ def build_agent(
     *,
     config: BridgeConfig | None = None,
     backend: DeerFlowBackend | None = None,
+    runner: TurnRunner | None = None,
 ) -> DeerFlowAgent:
-    return DeerFlowAgent(connection, config=config, backend=backend)
+    return DeerFlowAgent(connection, config=config, backend=backend, runner=runner)
 
 
 __all__ = [

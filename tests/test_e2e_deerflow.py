@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import subprocess
 import sys
 import time
@@ -101,7 +102,7 @@ class Bridge:
 def bridge():
     procs: list[Bridge] = []
 
-    def factory() -> Bridge:
+    def factory(env_extra: dict | None = None) -> Bridge:
         proc = subprocess.Popen(
             [sys.executable, "-m", "deerflow_acp.cli", "acp"],
             stdin=subprocess.PIPE,
@@ -109,7 +110,7 @@ def bridge():
             stderr=subprocess.PIPE,
             text=True,
             cwd=DEERFLOW_ROOT,
-            env={**os.environ, "PYTHONUNBUFFERED": "1"},
+            env={**os.environ, "PYTHONUNBUFFERED": "1", **(env_extra or {})},
         )
         b = Bridge(proc)
         procs.append(b)
@@ -230,6 +231,122 @@ def test_e2e_stdout_carries_only_jsonrpc(bridge):
         if not line.strip():
             continue
         assert json.loads(line).get("jsonrpc") == "2.0"
+
+
+def _worker_children(bridge_pid: int) -> list[int]:
+    """桥进程直接派生的 worker 子进程 PID 列表。"""
+    out = subprocess.run(["pgrep", "-P", str(bridge_pid)], capture_output=True, text=True).stdout
+    return [int(x) for x in out.split()]
+
+
+def _pgid_alive(pgid: int) -> bool:
+    try:
+        os.killpg(pgid, 0)
+    except (ProcessLookupError, PermissionError):
+        return False
+    return True
+
+
+def test_e2e_cancel_kills_real_worker_process_group(bridge):
+    """真实 DeerFlow 卡在模型调用里时，取消超时必须终止整个 worker 进程组。
+
+    宽限期压到 0.5s，确保走的是强制终止分支而非协作退出。
+    """
+    b = bridge({"DEERFLOW_ACP_CANCEL_GRACE_SECONDS": "0.5"})
+    b.initialize()
+    session_id = b.new_session()
+
+    rid = b.send(
+        "session/prompt",
+        {"sessionId": session_id, "prompt": [{"type": "text", "text": "请写一篇 3000 字的散文，主题是秋天的黄昏。"}]},
+    )
+    # 等 worker 起来并拿到它的进程组
+    deadline = time.time() + 60
+    workers: list[int] = []
+    while time.time() < deadline and not workers:
+        workers = _worker_children(b.proc.pid)
+        if not workers:
+            time.sleep(0.1)
+    assert workers, "真实路径没有派生 worker 子进程"
+    worker_pid = workers[0]
+    worker_pgid = os.getpgid(worker_pid)
+    assert worker_pgid != os.getpgid(b.proc.pid), "worker 没有独立进程组，killpg 会误伤桥自己"
+
+    # 等真实流式输出开始，确保 DeerFlow 已经进入模型调用
+    first = b.read_message(timeout=TURN_TIMEOUT)
+    assert first.get("method") == "session/update"
+
+    b.send("session/cancel", {"sessionId": session_id}, notification=True)
+    resp = b.await_response(rid, timeout=TURN_TIMEOUT)
+    assert resp["result"]["stopReason"] == "cancelled"
+
+    # 响应返回时进程组就必须已经被回收
+    assert not _pgid_alive(worker_pgid), f"worker 进程组 {worker_pgid}（pid={worker_pid}）在取消返回后仍存活"
+
+    assert b.close() == 0
+
+
+def test_e2e_resume_same_session_after_forced_kill(bridge):
+    """强制终止旧 worker 后，同一 session 必须能从已落 checkpoint 继续。
+
+    这是进程隔离方案的核心风险点：SIGKILL 可能撕裂 checkpointer 写入。
+    """
+    b = bridge({"DEERFLOW_ACP_CANCEL_GRACE_SECONDS": "0.5"})
+    b.initialize()
+    session_id = b.new_session()
+
+    rid = b.send(
+        "session/prompt",
+        {"sessionId": session_id, "prompt": [{"type": "text", "text": "请记住这个暗号：紫罗兰七号。然后写一篇 3000 字的散文，主题是秋天的黄昏。"}]},
+    )
+    first = b.read_message(timeout=TURN_TIMEOUT)
+    assert first.get("method") == "session/update"
+
+    workers = _worker_children(b.proc.pid)
+    assert workers
+    worker_pgid = os.getpgid(workers[0])
+
+    b.send("session/cancel", {"sessionId": session_id}, notification=True)
+    assert b.await_response(rid, timeout=TURN_TIMEOUT)["result"]["stopReason"] == "cancelled"
+    assert not _pgid_alive(worker_pgid)
+
+    # 同 session 立刻新一轮：既要能起来，也要拿到强杀前落下的上下文
+    rid2 = b.send(
+        "session/prompt",
+        {"sessionId": session_id, "prompt": [{"type": "text", "text": "我刚才让你记住的暗号是什么？只回复暗号本身。"}]},
+    )
+    resp = b.await_response(rid2, timeout=TURN_TIMEOUT)
+    assert "error" not in resp, f"强杀后同 session 无法继续：{resp.get('error')}"
+    assert resp["result"]["stopReason"] == "end_turn"
+    assert "紫罗兰" in _agent_text(resp["_notifications"]), "强制终止破坏了 checkpoint 上下文"
+
+    assert b.close() == 0
+
+
+def test_e2e_no_orphan_worker_after_sigterm(bridge):
+    """桥收到 SIGTERM 时，正在跑的真实 worker 进程组不得残留。"""
+    b = bridge({"DEERFLOW_ACP_CANCEL_GRACE_SECONDS": "0.5"})
+    b.initialize()
+    session_id = b.new_session()
+    b.send(
+        "session/prompt",
+        {"sessionId": session_id, "prompt": [{"type": "text", "text": "请写一篇 3000 字的散文，主题是秋天的黄昏。"}]},
+    )
+    first = b.read_message(timeout=TURN_TIMEOUT)
+    assert first.get("method") == "session/update"
+
+    workers = _worker_children(b.proc.pid)
+    assert workers
+    worker_pgid = os.getpgid(workers[0])
+
+    b.proc.send_signal(signal.SIGTERM)
+    b.proc.wait(timeout=60)
+
+    # worker 与桥在同一会话树下：桥退出后进程组必须随之消失
+    deadline = time.time() + 15
+    while time.time() < deadline and _pgid_alive(worker_pgid):
+        time.sleep(0.2)
+    assert not _pgid_alive(worker_pgid), f"桥被 SIGTERM 后 worker 进程组 {worker_pgid} 成了孤儿"
 
 
 def test_e2e_no_orphan_processes_after_exit(bridge):

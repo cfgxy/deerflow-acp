@@ -5,34 +5,31 @@
 共用同一标识才能让「跨进程恢复」退化成「用同一个 thread_id 继续 stream」，
 桥自身不需要维护任何持久化映射表。
 
-DeerFlow ``stream()`` 是同步生成器，桥在专用工作线程中驱动它，
-通过 ``asyncio.Queue`` 把事件送回事件循环。取消采用协作式：
-置标志 → 工作线程在下一个 yield 边界调用 ``generator.close()``；
-超过宽限期仍未退出则放弃等待并如实标记为 escalated（见 ``TurnOutcome``）。
+**turn 的执行被放在独立进程组的 worker 子进程里**（见 :mod:`deerflow_acp.runner`）。
+这不是为了并行，而是为了取消能真正生效：DeerFlow 的模型调用与工具执行都发生在
+``next(generator)`` 内部，线程模型下无法强制打断——取消超时后那个线程会继续跑完
+模型调用、继续执行工具、继续往同一个 ``thread_id`` 写 checkpoint，而桥此时已经
+释放了 ``_running``，下一个 turn 就会与它并发写同一条 DeerFlow thread。
 
-**宽限期由事件循环侧计时，而不是等工作线程报到。** 后端完全可能卡在第一个
-（或下一个）yield **之前**——模型调用、工具执行都在 ``next(generator)`` 内部，
-此时工作线程既观察不到取消标志，也发不出完成信号。若事件循环无条件等待队列，
-``session/prompt`` 就会永久挂起，宽限期形同虚设。因此取消一旦触发，
-事件循环自己按 ``cancel_grace_seconds`` 倒计时；超时即把该 turn 判为 escalated
-并**弃用**那个工作线程：弃用后它的事件与完成信号一律丢弃，且它持有的是本轮
-专属的取消标志与队列，不会干扰同一 session 的后续 turn。
+因此取消的处理顺序是：置标志 → 向 worker 进程组发 ``SIGTERM`` 请求协作退出 →
+超过 ``cancel_grace_seconds`` 仍未退出则 ``killpg(SIGKILL)`` →
+**确认进程组已被回收之后**才释放 ``_running``。这条「确认退出」是同 session
+串行语义的支点：``_running`` 一旦释放，新 turn 立刻可以在同一 thread 上启动。
 """
 
 from __future__ import annotations
 
 import asyncio
-import concurrent.futures
 import re
 import threading
 import uuid
-from collections.abc import Iterator
 from dataclasses import dataclass, field
 from typing import Any
 
 from .backend import BackendUnavailableError, DeerFlowBackend
 from .config import BridgeConfig
 from .logging_setup import get_logger
+from .runner import InProcessTurnRunner, RunResult, SubprocessTurnRunner, TurnRunner
 
 logger = get_logger("session")
 
@@ -40,12 +37,6 @@ logger = get_logger("session")
 # 1-64 位 ASCII 字母、数字、连字符或下划线。ACP sessionId 直接作为 thread_id
 # 使用，因此必须在桥这一层就拒掉不合法的值，而不是让 DeerFlow 抛 ValueError。
 _THREAD_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
-
-_SENTINEL_DONE = object()
-
-#: 工作线程在阻塞等待队列时的取消轮询间隔。只影响「队列满 + 已取消」这一条
-#: 慢路径；正常路径仍由 future 完成唤醒，不受这个间隔拖慢。
-_CANCEL_POLL_SECONDS = 0.05
 
 
 class SessionIdError(ValueError):
@@ -79,13 +70,22 @@ class TurnOutcome:
         stop_reason: ACP ``StopReason``。
         usage_payload: DeerFlow ``end`` 事件里的累计 token 用量，可能为 None。
         error: 后端异常（若有），由调用方转成 JSON-RPC error。
-        escalated: 取消宽限期内后端未协作退出，桥已放弃等待。
+        escalated: 取消宽限期内后端未协作退出，桥动用了强制终止手段。
+        worker_pid: 执行本轮的 worker 子进程 PID；进程内执行路径为 None。
+        worker_pgid: worker 进程组 ID；进程内执行路径为 None。
+        worker_killed: 是否真的执行过 ``killpg(SIGKILL)``。
+        worker_reaped: 强制终止后是否已确认进程退出。False 表示旧执行体可能
+            仍在写同一条 DeerFlow thread——这是必须如实上报的严重状态。
     """
 
     stop_reason: str
     usage_payload: dict[str, Any] | None = None
     error: BaseException | None = None
     escalated: bool = False
+    worker_pid: int | None = None
+    worker_pgid: int | None = None
+    worker_killed: bool = False
+    worker_reaped: bool = True
 
 
 @dataclass
@@ -94,12 +94,13 @@ class Session:
 
     session_id: str
     cwd: str
-    #: 当前 turn 的取消标志；置位后工作线程会在下一个 yield 边界关闭生成器。
-    #: 每个 turn 换一个新对象——被弃用的工作线程仍持有旧对象，
-    #: 因此它永远看不到新 turn 的状态，新 turn 也不会被它的取消标志误伤。
+    #: 当前 turn 的取消标志。每个 turn 换一个新对象——虽然 worker 已被强制终止，
+    #: 换新对象仍是最省心的做法：任何持有旧对象的残留引用都看不到新 turn 的状态。
     cancel_event: threading.Event = field(default_factory=threading.Event)
     #: 当前 turn 的完成信号（供 stdin 断连时等待收尾）
     turn_finished: asyncio.Event | None = None
+    #: 最近一次 turn 的 worker PID，仅用于观测与日志
+    last_worker_pid: int | None = None
     _running: bool = False
 
     @property
@@ -110,12 +111,27 @@ class Session:
 class SessionRegistry:
     """会话注册表：新建、查找、恢复与关闭。"""
 
-    def __init__(self, backend: DeerFlowBackend, config: BridgeConfig) -> None:
+    def __init__(
+        self,
+        backend: DeerFlowBackend,
+        config: BridgeConfig,
+        *,
+        runner: TurnRunner | None = None,
+    ) -> None:
         self._backend = backend
         self._config = config
         self._sessions: dict[str, Session] = {}
-        #: 宽限期内未协作退出、已被弃用的工作线程（仅用于观测与收割）
-        self._abandoned: set[threading.Thread] = set()
+        # 默认按后端类型选执行器：真实的嵌入式后端由 worker 子进程加载（可强制终止），
+        # 直接注入的后端对象跨不过进程边界，只能在进程内跑（无强制终止能力）。
+        self._runner = runner or self._default_runner(backend, config)
+
+    @staticmethod
+    def _default_runner(backend: DeerFlowBackend, config: BridgeConfig) -> TurnRunner:
+        from .backend import EmbeddedDeerFlowBackend
+
+        if isinstance(backend, EmbeddedDeerFlowBackend):
+            return SubprocessTurnRunner(config)
+        return InProcessTurnRunner(backend)
 
     # ------------------------------------------------------------------
     # 生命周期
@@ -171,6 +187,16 @@ class SessionRegistry:
     def active_sessions(self) -> list[Session]:
         return [s for s in self._sessions.values() if s.running]
 
+    def terminate_all_workers(self) -> list[int]:
+        """关停兜底：强制终止执行器仍持有的所有 worker 进程组。
+
+        协作式取消 + 宽限期覆盖不了「桥即刻退出、事件循环被拆掉」这种形态；
+        没有这一步，正在跑的 worker 会成为孤儿继续消耗模型配额并写半截状态。
+        进程内执行器没有强制终止能力，返回空列表。
+        """
+        terminate = getattr(self._runner, "terminate_all", None)
+        return list(terminate()) if callable(terminate) else []
+
     # ------------------------------------------------------------------
     # turn 执行
     # ------------------------------------------------------------------
@@ -183,6 +209,10 @@ class SessionRegistry:
     ) -> TurnOutcome:
         """驱动一次 turn，把 DeerFlow 事件逐条交给 ``on_event`` 协程。
 
+        ``_running`` 的释放时机是这里最关键的语义：只有执行器返回之后才释放，
+        而子进程执行器在返回前已确认 worker 进程组被回收。因此下一个 turn 启动时，
+        不可能存在另一个进程还在写同一条 DeerFlow thread。
+
         Args:
             session: 目标会话。
             message: 用户消息文本。
@@ -192,163 +222,61 @@ class SessionRegistry:
             raise TurnAlreadyRunningError(session.session_id)
 
         session._running = True
-        # 换新对象而不是 clear()：上一轮若被弃用，那个工作线程还握着旧 Event，
-        # 复用同一对象会让它的取消状态渗进本轮。
         session.cancel_event = threading.Event()
         session.turn_finished = asyncio.Event()
 
-        loop = asyncio.get_running_loop()
-        # 本轮专属队列：被弃用的工作线程只会往它自己那份队列里写，
-        # 写进去也没人读，不会污染后续 turn。
-        queue: asyncio.Queue[Any] = asyncio.Queue(maxsize=256)
         cancel_event = session.cancel_event
-        backend = self._backend
         session_id = session.session_id
-
-        # 工作线程独占生成器：生成器的 next()/close() 必须在同一线程调用，
-        # 跨线程 close() 在 CPython 中会破坏生成器帧状态。
-        def put_with_backpressure(event: tuple[str, dict[str, Any]]) -> bool:
-            """把事件放进队列，等待期间保持对取消标志的响应。
-
-            返回 False 表示本轮已被取消/弃用，工作线程应立即收摊。
-            直接 ``fut.result()`` 无限等是不行的：队列满时（事件循环侧已经不再
-            读取，比如本轮已被弃用）工作线程会永远卡在这里，连生成器都关不掉。
-            """
-            fut = asyncio.run_coroutine_threadsafe(queue.put(event), loop)
-            while True:
-                if cancel_event.is_set():
-                    fut.cancel()
-                    return False
-                try:
-                    fut.result(timeout=_CANCEL_POLL_SECONDS)
-                    return True
-                except concurrent.futures.TimeoutError:
-                    continue
-
-        def worker() -> None:
-            generator: Iterator[tuple[str, dict[str, Any]]] | None = None
-            error: BaseException | None = None
-            cancelled = False
-            try:
-                generator = backend.stream(message, thread_id=session_id)
-                for event in generator:
-                    if cancel_event.is_set():
-                        cancelled = True
-                        break
-                    if not put_with_backpressure(event):
-                        cancelled = True
-                        break
-                    if cancel_event.is_set():
-                        cancelled = True
-                        break
-            except BaseException as exc:  # noqa: BLE001 —— 后端可抛任意异常，必须完整回传
-                error = exc
-            finally:
-                if generator is not None and cancelled:
-                    close = getattr(generator, "close", None)
-                    if callable(close):
-                        try:
-                            close()
-                        except BaseException:  # noqa: BLE001
-                            logger.warning("关闭 DeerFlow 生成器时出错", exc_info=True)
-                loop.call_soon_threadsafe(queue.put_nowait, (_SENTINEL_DONE, error, cancelled))
-
-        thread = threading.Thread(target=worker, name=f"deerflow-turn-{session_id}", daemon=True)
-        thread.start()
-
-        usage_payload: dict[str, Any] | None = None
-        error: BaseException | None = None
-        cancelled = False
-        escalated = False
         grace = self._config.cancel_grace_seconds
-        #: 取消触发后的绝对截止时刻；None 表示尚未取消
-        deadline: float | None = None
 
-        # 持久 getter：每轮循环复用同一个取数任务，超时只是「这轮没等到」，
-        # 不取消它。若改用 ``asyncio.wait_for(queue.get(), ...)``，每次超时都会
-        # 取消一个已经排进 ``_getters`` 的等待者，在取消竞态下容易丢事件。
-        getter: asyncio.Task[Any] | None = None
         try:
-            while True:
-                if deadline is None and cancel_event.is_set():
-                    # 取消一进来就由事件循环侧计时，不依赖工作线程报到——
-                    # 它可能正卡在 next(generator) 里，永远到不了下一个 yield。
-                    deadline = loop.time() + grace
-
-                if getter is None:
-                    getter = asyncio.ensure_future(queue.get())
-
-                if deadline is None:
-                    # 未取消时也要定期醒来，否则取消通知到达时我们正睡在
-                    # queue.get() 上，宽限期根本不会开始计时。
-                    timeout = _CANCEL_POLL_SECONDS
-                else:
-                    timeout = deadline - loop.time()
-                    if timeout <= 0:
-                        escalated = True
-                        cancelled = True
-                        break
-
-                await asyncio.wait({getter}, timeout=timeout)
-                if not getter.done():
-                    if deadline is not None and loop.time() >= deadline:
-                        escalated = True
-                        cancelled = True
-                        break
-                    continue
-
-                item = getter.result()
-                getter = None
-
-                if isinstance(item, tuple) and len(item) == 3 and item[0] is _SENTINEL_DONE:
-                    _, error, cancelled = item
-                    break
-                event_type, data = item
-                if event_type == "end":
-                    usage_payload = data.get("usage") if isinstance(data, dict) else None
-                await on_event(event_type, data)
+            result: RunResult = await self._runner.execute(
+                session_id=session_id,
+                message=message,
+                on_event=on_event,
+                cancel_event=cancel_event,
+                grace=grace,
+            )
         finally:
-            if getter is not None and not getter.done():
-                getter.cancel()
+            # 执行器返回即代表旧执行体已终结（子进程路径已确认回收），
+            # 此时释放 running 才是安全的。
             session._running = False
             if session.turn_finished is not None:
                 session.turn_finished.set()
 
-        if escalated:
-            # 弃用这个工作线程：它握着本轮专属的 cancel_event 与 queue，
-            # 醒来后会自行收摊；即便一直卡着，也碰不到 session 的新状态。
-            # 它是 daemon 线程，不会阻止进程退出。
-            self._abandoned.add(thread)
-            self._reap_abandoned()
+        session.last_worker_pid = result.worker_pid
+
+        if result.escalated:
             logger.warning(
-                "会话 %s 的 DeerFlow turn 在 %.1fs 宽限期内未协作退出，已弃用工作线程 %s",
+                "会话 %s 的 turn 在 %.1fs 宽限期内未协作退出（worker pid=%s pgid=%s，已强制终止=%s，已确认回收=%s）",
                 session_id,
                 grace,
-                thread.name,
+                result.worker_pid,
+                result.worker_pgid,
+                result.worker_killed,
+                result.worker_reaped,
             )
-            return TurnOutcome(stop_reason="cancelled", usage_payload=usage_payload, escalated=True)
 
-        if cancelled or cancel_event.is_set():
-            # 工作线程已经发出完成信号，join 只是确认 close() 已跑完。
-            await asyncio.to_thread(thread.join, grace)
-            escalated = thread.is_alive()
-            if escalated:
-                self._abandoned.add(thread)
-                logger.warning(
-                    "会话 %s 的工作线程 %s 在 close() 后仍未退出，已弃用",
-                    session_id,
-                    thread.name,
-                )
-            return TurnOutcome(stop_reason="cancelled", usage_payload=usage_payload, escalated=escalated)
+        outcome = TurnOutcome(
+            stop_reason="end_turn",
+            usage_payload=result.usage_payload,
+            escalated=result.escalated,
+            worker_pid=result.worker_pid,
+            worker_pgid=result.worker_pgid,
+            worker_killed=result.worker_killed,
+            worker_reaped=result.worker_reaped,
+        )
 
-        if error is not None:
-            return TurnOutcome(stop_reason="refusal", usage_payload=usage_payload, error=error)
+        if result.cancelled or cancel_event.is_set():
+            outcome.stop_reason = "cancelled"
+            return outcome
 
-        return TurnOutcome(stop_reason="end_turn", usage_payload=usage_payload)
+        if result.error is not None:
+            outcome.stop_reason = "refusal"
+            outcome.error = result.error
+            return outcome
 
-    def _reap_abandoned(self) -> None:
-        """清掉已经自行退出的弃用线程，避免集合无界增长。"""
-        self._abandoned = {t for t in self._abandoned if t.is_alive()}
+        return outcome
 
 
 __all__ = [

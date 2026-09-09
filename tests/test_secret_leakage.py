@@ -13,7 +13,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import threading
 from typing import Any
 
 import pytest
@@ -26,6 +28,7 @@ from deerflow_acp.agent import DeerFlowAgent
 from deerflow_acp.backend import BackendUnavailableError
 from deerflow_acp.config import BridgeConfig
 from deerflow_acp.events import EventNormalizer
+from deerflow_acp.session import SessionRegistry
 
 # 构造的假秘密：形态逼真但完全无效
 FAKE_KEY = "sk-proj-Ab3xQ9zK7mNpR2vT5wY8cE1dF4gH6jL0oP"
@@ -172,4 +175,76 @@ def test_normal_event_text_is_untouched():
     )
     assert "127.0.0.1:8080 超时" in _texts(updates)
 
+
+# ----------------------------------------------------------------------
+# 4) 生成器 close() 阶段的异常
+# ----------------------------------------------------------------------
+
+
+class ClosePoisonBackend:
+    """``close()`` 时抛出携带秘密的异常的后端。
+
+    这是取消路径上最容易被忽略的泄露口：``generator.close()`` 会在生成器内部
+    抛 ``GeneratorExit``，而清理代码（关连接、回滚事务、写审计）完全可能在这时
+    抛出带凭据的新异常。此前这里用 ``exc_info=True`` 记录，整条 traceback 连同
+    异常消息直接写进 stderr——而 stderr 是客户端可见的输出面。
+    """
+
+    def __init__(self, secret: str) -> None:
+        self.secret = secret
+        self.gate = threading.Event()
+
+    def stream(self, message: str, *, thread_id: str) -> Any:
+        secret = self.secret
+        gate = self.gate
+
+        def gen() -> Any:
+            try:
+                for i in range(200):
+                    gate.set()
+                    yield ("messages-tuple", {"type": "ai", "content": f"chunk-{i}", "id": "m"})
+            except GeneratorExit:
+                raise RuntimeError(f"清理连接失败：{secret}") from None
+
+        return gen()
+
+    def thread_exists(self, thread_id: str) -> bool:
+        return False
+
+    def history(self, thread_id: str) -> list[dict[str, Any]]:
+        return []
+
+
+async def test_generator_close_error_does_not_leak_secret_to_stderr(caplog):
+    """``close()`` 抛异常时，stderr 只允许出现异常类型名。"""
+    backend = ClosePoisonBackend(FAKE_KEY)
+    registry = SessionRegistry(backend, BridgeConfig(cancel_grace_seconds=5.0))
+    session = registry.create("/tmp")
+
+    seen = 0
+
+    async def on_event(event_type: str, data: dict) -> None:
+        nonlocal seen
+        seen += 1
+        if seen == 3:
+            registry.cancel(session.session_id)
+
+    with caplog.at_level(logging.DEBUG, logger="deerflow_acp"):
+        outcome = await asyncio.wait_for(registry.run_turn(session, "问题", on_event), timeout=15)
+
+    assert outcome.stop_reason == "cancelled"
+
+    formatter = logging.Formatter("%(message)s")
+    emitted = "\n".join(
+        [record.getMessage() for record in caplog.records]
+        + [formatter.format(record) for record in caplog.records]
+        + [str(record.exc_info) for record in caplog.records]
+    )
+
+    assert FAKE_KEY not in emitted, "close() 异常把秘密写进了 stderr"
+    assert "Ab3xQ9zK7mNpR2vT5wY8cE1d" not in emitted
+    assert "关闭 DeerFlow 生成器时出错" in emitted, "该异常必须被记录，不能静默吞掉"
+    assert "RuntimeError" in emitted, "必须保留异常类型，否则不可诊断"
+    # 结构性保证：不得使用 exc_info——traceback 里同样有未脱敏的异常消息
+    assert all(record.exc_info is None for record in caplog.records), "日志不得携带 traceback"
 

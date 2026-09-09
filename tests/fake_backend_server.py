@@ -46,8 +46,15 @@ class ScriptedBackend:
         self._stall = float(script.get("stall_before_first_yield_s", 0))
         # 通过一个文件标记生成器是否被 close()，让父进程可以断言协作式取消
         self._closed_marker = os.environ.get("DEERFLOW_ACP_FAKE_CLOSED_MARKER")
+        # 往 fd 1 打垃圾，验证「后端污染 stdout」不会撕裂承载在 fd 1 上的通道
+        self._pollute_stdout = bool(script.get("pollute_stdout"))
 
     def stream(self, message: str, *, thread_id: str) -> Iterator[tuple[str, dict[str, Any]]]:
+        if self._pollute_stdout:
+            print("这行垃圾绝不能出现在 IPC 通道里")
+            sys.stdout.write("再来一行\n")
+            sys.stdout.flush()
+            os.write(1, "裸 write 也不行\n".encode())
         if self._raise_unavailable:
             from deerflow_acp.backend import BackendUnavailableError
 
@@ -83,9 +90,27 @@ class ScriptedBackend:
         return list(self._threads.get(thread_id, []))
 
 
+def build_backend(config: Any) -> ScriptedBackend:
+    """worker 子进程侧的脚本后端工厂。
+
+    通过 ``DEERFLOW_ACP_WORKER_BACKEND=fake_backend_server:build_backend`` 注入。
+    脚本对象跨不过进程边界，所以 worker 里重新读一遍同一个脚本文件。
+    """
+    script_path = os.environ["DEERFLOW_ACP_FAKE_SCRIPT"]
+    with open(script_path, encoding="utf-8") as fh:
+        backend = ScriptedBackend(json.load(fh))
+
+    # 把 worker 自己的 pid/pgid 落盘：契约测试据此断言取消超时后进程组真的退出了。
+    # 这两个数字在 JSON-RPC 报文里不存在，只能由 worker 侧自报。
+    pid_path = os.environ.get("DEERFLOW_ACP_FAKE_WORKER_PID")
+    if pid_path:
+        with open(pid_path, "w", encoding="utf-8") as fh:
+            fh.write(f"{os.getpid()} {os.getpgid(0)}")
+    return backend
+
+
 def main() -> int:
-    from deerflow_acp.agent import DeerFlowAgent
-    from deerflow_acp.cli import isolate_stdout
+    from deerflow_acp.cli import isolate_stdout, serve
     from deerflow_acp.config import BridgeConfig
     from deerflow_acp.logging_setup import configure_logging, redirect_root_logging_to_stderr
 
@@ -99,6 +124,14 @@ def main() -> int:
     backend = ScriptedBackend(script)
     config = BridgeConfig.from_env()
 
+    # 默认走进程内执行（脚本后端是本进程里的对象）。设了这个变量则改走真实的
+    # worker 子进程路径——契约测试用它验证生产链路上的进程隔离与取消。
+    runner = None
+    if os.environ.get("DEERFLOW_ACP_FAKE_USE_WORKER"):
+        from deerflow_acp.runner import SubprocessTurnRunner
+
+        runner = SubprocessTurnRunner(config)
+
     protocol_stdout = isolate_stdout()
 
     # 故意在协议启动后往 fd 1 写垃圾：验证 stdout 隔离确实有效。
@@ -108,21 +141,9 @@ def main() -> int:
         sys.stdout.flush()
         os.write(1, "裸 write 也不行\n".encode())
 
-    async def run() -> int:
-        import acp
-
-        from deerflow_acp.cli import _stdio_streams
-
-        reader, writer = await _stdio_streams(protocol_stdout)
-        await acp.run_agent(
-            lambda conn: DeerFlowAgent(conn, config=config, backend=backend),
-            input_stream=writer,
-            output_stream=reader,
-            use_unstable_protocol=True,
-        )
-        return 0
-
-    return asyncio.run(run())
+    # 走真实的 cli.serve：信号处理、宽限期与关停时的 worker 回收都在那里，
+    # 自己另起一套 run_agent 就把这些行为排除在契约测试之外了。
+    return asyncio.run(serve(config, protocol_stdout, backend=backend, runner=runner))
 
 
 if __name__ == "__main__":

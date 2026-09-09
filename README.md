@@ -12,12 +12,19 @@ DeerFlow 与 ACP（Agent Client Protocol）客户端之间的**独立桥接器**
 flowchart LR
     C["ACP Client<br/>(Multica hermes backend)"] -- "JSON-RPC / stdio" --> S["deerflow-acp acp<br/>(ACP server)"]
     S --> R["SessionRegistry<br/>sessionId ↔ thread_id"]
-    R --> W["worker thread<br/>驱动同步生成器"]
-    W --> D["DeerFlowClient.stream()"]
-    D --> N["EventNormalizer"]
+    R -- "spawn / ndJSON over stdout" --> W["worker 子进程<br/>独立进程组"]
+    W --> D["DeerFlowClient.stream()<br/>（嵌入式 API）"]
+    D --> N0["worker 侧序列化事件"]
+    N0 -- "ndJSON" --> N["EventNormalizer<br/>（桥进程）"]
     N -- "session/update" --> C
     D --> CP[("LangGraph<br/>checkpointer")]
 ```
+
+**每个 turn 一个 worker 子进程**，以 `start_new_session=True` 置于独立进程组。
+这不是为了并行，而是为了**可终止**：DeerFlow 的模型调用与工具执行卡在
+`next(generator)` 内部时，Python 线程无法被打断，进程可以。桥与 worker 之间
+只走一条 ndJSON 管道（4 种消息 `ready` / `ev` / `done` / `err`），DeerFlow 对象
+本身从不跨进程。
 
 关键设计：
 
@@ -25,8 +32,11 @@ flowchart LR
 | --- | --- |
 | 会话映射 | ACP `sessionId` **就是** DeerFlow `thread_id`（同一字符串），桥不维护额外映射表 |
 | 会话恢复 | 以 `DeerFlowClient.get_thread()` 是否返回 checkpoint 为唯一依据；不存在则报错，绝不静默新建 |
-| 取消 | 协作式优先：置标志 → 工作线程在下一个 yield 边界 `generator.close()`。宽限期由**事件循环侧**计时，因此后端即使卡在 yield **之前**（模型/工具调用还没返回），`session/prompt` 仍在宽限期内返回 `cancelled` 并标记 `escalated`；卡住的工作线程被弃用，不影响同一 session 的后续 turn |
-| stdout 纪律 | 启动时 `dup(1)` 出协议专用 fd，再把 fd 1 重定向到 fd 2；任何 `print` 物理上无法污染协议流 |
+| 取消 | 协作式优先：`session/cancel` → 向 worker 进程组发 `SIGTERM`，worker 在下一个 yield 边界 `generator.close()`。宽限期由**事件循环侧**计时，因此后端即使卡在 yield **之前**（模型/工具调用还没返回），`session/prompt` 仍在宽限期内返回 `cancelled`；超时则 `killpg(SIGKILL)` 终止**整个进程组**（连带 DeerFlow 派生的工具子进程），并**等到进程确认退出后才释放 session**——旧 worker 不可能与下一个 turn 并发写同一条 thread |
+| 进程隔离 | 每 turn 一个独立进程组的 worker 子进程；强杀后同 session 从 DeerFlow checkpoint 继续，不丢上下文 |
+| 孤儿回收 | 双闸：turn 协程被中断时同步 `killpg`；关停路径在宽限期后再兜底 `terminate_all_workers()`。stdin EOF、`SIGINT`/`SIGTERM`、异常退出三条路径都不留桥创建的孤儿进程 |
+| stdout 纪律 | **两层** fd 隔离。桥进程与 worker 进程各自 `dup(1)` 出通道专用 fd 后 `dup2(2, 1)`：任何 `print`（含 C 扩展裸 `write`）物理上无法污染 JSON-RPC 流或 ndJSON IPC 流 |
+| 跨进程错误 | worker 侧异常**只把类型名**送过 IPC 边界：消息、`args`、`__cause__`、traceback 一律不过河。凭据即使被某个 SDK 塞进异常消息也不可能到达桥进程 |
 | 后端加载 | `initialize` 只回能力，不构造 `DeerFlowClient`；重型后端在首个真实请求时才拉起 |
 | 凭据 | 桥不存储、不打印、不上传任何秘密；完全沿用 DeerFlow 既有的本地 `.env` 注入机制 |
 | 秘密脱敏 | 所有离开进程的文本（JSON-RPC 响应体、stderr 日志、客户端可见事件）统一过 `sanitize.redact_text()`；对外错误只保留异常**类型名**等可诊断分类，不回显异常消息、traceback 与配置内容 |
@@ -68,7 +78,7 @@ Multica 的 hermes backend 会无条件在 argv 末尾拼接 `acp`，所以在 M
 | `DEERFLOW_ACP_CONFIG_PATH` | 空 | DeerFlow `config.yaml` 路径；空则由 DeerFlow 自行解析 |
 | `DEERFLOW_ACP_MODEL` | 空 | 覆盖 DeerFlow 默认模型名 |
 | `DEERFLOW_ACP_THINKING` | `true` | 是否请求模型输出推理内容（映射为 `agent_thought_chunk`） |
-| `DEERFLOW_ACP_CANCEL_GRACE_SECONDS` | `5` | 取消后等待后端协作退出的宽限期 |
+| `DEERFLOW_ACP_CANCEL_GRACE_SECONDS` | `5` | 取消后等待 worker 协作退出的宽限期；超时即 `killpg(SIGKILL)` |
 | `DEERFLOW_ACP_SHUTDOWN_GRACE_SECONDS` | `5` | 收到 SIGTERM/SIGINT 后等待在途 turn 收尾的时限 |
 | `DEERFLOW_ACP_CONTEXT_WINDOW_TOKENS` | 空 | 上下文窗口大小；不设则**不下发** `usage_update` |
 | `DEERFLOW_ACP_EMIT_USAGE_UPDATE` | `false` | 仅在同时设置了窗口大小时生效，见下方「usage 降级」 |
@@ -109,6 +119,10 @@ API key 一律走 DeerFlow 自己的 gitignored `.env`，桥不接触。
 ## 测试
 
 ```bash
-.venv/bin/pytest -q                       # 单元 + 协议契约测试
+.venv/bin/pytest -q                       # 单元 + 协议契约测试（含真 worker 子进程）
 DEERFLOW_ACP_E2E=1 .venv/bin/pytest -q tests/test_e2e_deerflow.py   # 需要本机 DeerFlow
 ```
+
+契约测试（`tests/test_contract_ndjson.py`）默认走进程内后端验证 JSON-RPC 报文形状；
+带 `worker_path` 前缀的用例设 `DEERFLOW_ACP_FAKE_USE_WORKER=1`，跑**生产路径**——
+真子进程、真进程组、真 `killpg`，并由 worker 自报 pid/pgid 供父进程断言回收。

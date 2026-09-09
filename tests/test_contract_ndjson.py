@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import subprocess
 import sys
 import time
@@ -30,10 +31,17 @@ TEXT_EVENTS = [
 class Peer:
     """一个跑在子进程里的 ACP server，父进程直接读写 ndJSON。"""
 
-    def __init__(self, proc: subprocess.Popen, closed_marker: Path) -> None:
+    def __init__(self, proc: subprocess.Popen, closed_marker: Path, worker_pid_path: Path) -> None:
         self.proc = proc
         self.closed_marker = closed_marker
+        #: worker 子进程自报的 "pid pgid"；只有走 worker 路径的用例会写。
+        self.worker_pid_path = worker_pid_path
         self._next_id = 0
+
+    def worker_ids(self) -> tuple[int, int]:
+        """读 worker 自报的 (pid, pgid)。"""
+        pid, pgid = self.worker_pid_path.read_text(encoding="utf-8").split()
+        return int(pid), int(pgid)
 
     def send_raw(self, line: str) -> None:
         assert self.proc.stdin is not None
@@ -116,10 +124,15 @@ def peer(tmp_path):
         script_path = tmp_path / f"script-{len(procs)}.json"
         script_path.write_text(json.dumps(script), encoding="utf-8")
         closed_marker = tmp_path / f"closed-{len(procs)}.marker"
+        worker_pid_path = tmp_path / f"worker-{len(procs)}.pid"
 
         env = dict(os.environ)
         env["DEERFLOW_ACP_FAKE_SCRIPT"] = str(script_path)
         env["DEERFLOW_ACP_FAKE_CLOSED_MARKER"] = str(closed_marker)
+        env["DEERFLOW_ACP_FAKE_WORKER_PID"] = str(worker_pid_path)
+        # worker 子进程用 `-m deerflow_acp.worker` 启动，需要能 import 到
+        # tests/ 下的 fake_backend_server 才能加载脚本后端。
+        env["PYTHONPATH"] = os.pathsep.join([str(TESTS_DIR), env.get("PYTHONPATH", "")]).rstrip(os.pathsep)
         env["PYTHONUNBUFFERED"] = "1"
         env.update(env_extra or {})
 
@@ -131,7 +144,7 @@ def peer(tmp_path):
             text=True,
             env=env,
         )
-        p = Peer(proc, closed_marker)
+        p = Peer(proc, closed_marker, worker_pid_path)
         procs.append(p)
         return p
 
@@ -489,6 +502,30 @@ def test_sigterm_terminates_without_orphan_children(peer):
 CONTRACT_FAKE_KEY = "sk-proj-Ab3xQ9zK7mNpR2vT5wY8cE1dF4gH6jL0oP"
 CONTRACT_FAKE_DSN = "postgres://dfuser:Sup3rS3cretPw@127.0.0.1:5432/deerflow"
 
+#: 让 ACP server 走**生产路径**：turn 在独立进程组的 worker 子进程里执行。
+#: 上面那些进程内路径的用例只能证明 JSON-RPC 报文形状，证明不了进程隔离。
+WORKER_PATH_ENV = {
+    "DEERFLOW_ACP_FAKE_USE_WORKER": "1",
+    "DEERFLOW_ACP_WORKER_BACKEND": "fake_backend_server:build_backend",
+}
+
+
+def _pgid_alive(pgid: int) -> bool:
+    try:
+        os.killpg(pgid, 0)
+    except (ProcessLookupError, PermissionError):
+        return False
+    return True
+
+
+def _wait_worker_ids(p: Peer, timeout: float = 10.0) -> tuple[int, int]:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if p.worker_pid_path.exists() and p.worker_pid_path.read_text(encoding="utf-8").strip():
+            return p.worker_ids()
+        time.sleep(0.05)
+    raise AssertionError("worker 子进程没有自报 pid——生产路径没被启用")
+
 
 def test_cancel_returns_within_grace_when_backend_stalls_before_first_yield(peer):
     """最难的一种取消：后端卡在 next(generator) 内部，永远到不了 yield 边界。
@@ -540,6 +577,218 @@ def test_session_reusable_after_stalled_cancel(peer):
 
     p.proc.kill()
     p.proc.wait(timeout=5)
+
+
+# ----------------------------------------------------------------------
+# 生产路径：turn 跑在可终止的 worker 子进程里（真三层进程）
+# ----------------------------------------------------------------------
+
+
+def test_worker_path_full_turn_keeps_same_contract(peer):
+    """切到 worker 子进程后，JSON-RPC 报文形状必须与进程内路径完全一致。
+
+    事件要跨一层 ndJSON IPC 才到达客户端，归一化与用量统计都可能在这里丢东西。
+    """
+    p = peer({"events": TEXT_EVENTS}, env_extra=WORKER_PATH_ENV)
+    p.initialize()
+    session_id = p.new_session()
+
+    rid = p.send("session/prompt", {"sessionId": session_id, "prompt": [{"type": "text", "text": "你好"}]})
+    resp = p.await_response(rid, timeout=30)
+
+    assert resp["result"]["stopReason"] == "end_turn"
+    assert resp["result"]["usage"]["totalTokens"] == 7
+    updates = [n for n in resp["_notifications"] if n.get("method") == "session/update"]
+    assert [u["params"]["update"]["sessionUpdate"] for u in updates] == ["agent_message_chunk"]
+    assert updates[0]["params"]["update"]["content"]["text"] == "你好"
+
+    worker_pid, worker_pgid = _wait_worker_ids(p)
+    assert worker_pid != p.proc.pid, "turn 没有跑在独立子进程里"
+    assert not _pgid_alive(worker_pgid), "正常结束后 worker 进程组仍然存活"
+
+    code, _ = p.close()
+    assert code == 0
+
+
+def test_worker_path_escalated_cancel_kills_process_group(peer):
+    """核心验收：后端卡死时，宽限期超时后 worker 进程组必须已经退出。
+
+    这正是线程模型做不到的事——被弃用的线程还会继续跑 DeerFlow。
+    """
+    p = peer(
+        {"events": TEXT_EVENTS, "stall_before_first_yield_s": 30},
+        env_extra={**WORKER_PATH_ENV, "DEERFLOW_ACP_CANCEL_GRACE_SECONDS": "0.5"},
+    )
+    p.initialize()
+    session_id = p.new_session()
+
+    rid = p.send("session/prompt", {"sessionId": session_id, "prompt": [{"type": "text", "text": "你好"}]})
+    worker_pid, worker_pgid = _wait_worker_ids(p)
+    assert _pgid_alive(worker_pgid)
+
+    p.send("session/cancel", {"sessionId": session_id}, notification=True)
+    started = time.time()
+    resp = p.await_response(rid, timeout=30)
+    elapsed = time.time() - started
+
+    assert resp["result"]["stopReason"] == "cancelled"
+    assert elapsed < 10, f"取消后 {elapsed:.1f}s 才返回，宽限期没有生效"
+    # 响应返回时进程组就必须已经死了——桥在释放 session 之前就完成了回收
+    assert not _pgid_alive(worker_pgid), f"worker 进程组 {worker_pgid}(pid={worker_pid}) 在取消返回后仍然存活"
+
+    p.proc.kill()
+    p.proc.wait(timeout=5)
+
+
+def test_worker_path_no_late_updates_after_original_stall_would_end(peer):
+    """等过原阻塞的自然释放时点，仍不得收到旧 turn 的晚到通知。
+
+    只等到取消返回是不够的：旧执行体真正的伤害发生在它「本该恢复」的那一刻。
+    """
+    p = peer(
+        {"events": TEXT_EVENTS, "stall_before_first_yield_s": 4},
+        env_extra={**WORKER_PATH_ENV, "DEERFLOW_ACP_CANCEL_GRACE_SECONDS": "0.5"},
+    )
+    p.initialize()
+    session_id = p.new_session()
+
+    rid = p.send("session/prompt", {"sessionId": session_id, "prompt": [{"type": "text", "text": "你好"}]})
+    _, worker_pgid = _wait_worker_ids(p)
+    started = time.time()
+    p.send("session/cancel", {"sessionId": session_id}, notification=True)
+    resp = p.await_response(rid, timeout=30)
+    assert resp["result"]["stopReason"] == "cancelled"
+    assert not _pgid_alive(worker_pgid)
+
+    # 睡到超过原阻塞释放点；此时旧 worker 若还活着就会 yield 出事件
+    remaining = 4.0 - (time.time() - started) + 1.5
+    if remaining > 0:
+        time.sleep(remaining)
+
+    rid2 = p.send("session/prompt", {"sessionId": session_id, "prompt": [{"type": "text", "text": "第二问"}]})
+    second = p.await_response(rid2, timeout=30)
+    assert "error" not in second, f"旧 worker 拖累了后续 turn：{second.get('error')}"
+    assert second["result"]["stopReason"] == "end_turn"
+    # 第二轮只应看到它自己的一条 chunk；旧 turn 的晚到事件会让这里变多
+    updates = [n for n in second["_notifications"] if n.get("method") == "session/update"]
+    assert len(updates) == 1, f"出现了旧 turn 的晚到通知：{updates}"
+
+    p.proc.kill()
+    p.proc.wait(timeout=5)
+
+
+def test_worker_path_secret_never_reaches_jsonrpc_or_stderr(peer):
+    """异常跨 IPC 只剩类型名：报文与 stderr 都不得出现构造假秘密。"""
+    p = peer(
+        {"events": TEXT_EVENTS, "raise": f"provider 拒绝：{CONTRACT_FAKE_KEY}"},
+        env_extra=WORKER_PATH_ENV,
+    )
+    p.initialize()
+    session_id = p.new_session()
+
+    rid = p.send("session/prompt", {"sessionId": session_id, "prompt": [{"type": "text", "text": "你好"}]})
+    resp = p.await_response(rid, timeout=30)
+
+    wire = json.dumps(resp, ensure_ascii=False)
+    assert CONTRACT_FAKE_KEY not in wire
+    assert "RuntimeError" in wire, "错误分类不得被抹掉，否则不可诊断"
+
+    _, stderr = p.close()
+    assert CONTRACT_FAKE_KEY not in stderr
+    # ACP SDK 的 task supervisor 会在 root logger 上打一条 traceback。它记录的
+    # 只能是桥抛出的、消息已固定脱敏的 RequestError；后端原始异常必须在
+    # IPC 边界就被压成类型名，绝不能作为 __cause__ 挂在链上一起打出来。
+    assert "RequestError" in stderr
+    assert "direct cause" not in stderr, "原始后端异常被挂成 __cause__ 打进了 traceback"
+    assert "during handling of the above" not in stderr.lower()
+    # worker 自己的日志同样只留类型名
+    assert "worker turn 失败：RuntimeError" in stderr
+
+
+def test_worker_path_stdout_stays_pure_jsonrpc(peer):
+    """worker 往 fd 1 打垃圾时，ACP 的 stdout 仍必须逐行是合法 JSON-RPC。
+
+    这里有两层 fd 隔离要同时成立：worker 把 fd 1 让给 IPC，桥把 fd 1 让给协议。
+    """
+    p = peer(
+        {"events": TEXT_EVENTS, "pollute_stdout": True},
+        env_extra=WORKER_PATH_ENV,
+    )
+    p.initialize()
+    session_id = p.new_session()
+
+    rid = p.send("session/prompt", {"sessionId": session_id, "prompt": [{"type": "text", "text": "你好"}]})
+    resp = p.await_response(rid, timeout=30)
+    assert resp["result"]["stopReason"] == "end_turn"
+
+    code, stderr = p.close()
+    assert code == 0
+    assert "这行垃圾绝不能出现在 IPC 通道里" in stderr, "worker 的 stdout 污染没有被改道到 stderr"
+
+
+def test_worker_path_no_orphan_after_stdin_eof(peer):
+    """stdin EOF 关停桥时，不得留下桥创建的 worker 孤儿进程。"""
+    p = peer({"events": TEXT_EVENTS}, env_extra=WORKER_PATH_ENV)
+    p.initialize()
+    session_id = p.new_session()
+    rid = p.send("session/prompt", {"sessionId": session_id, "prompt": [{"type": "text", "text": "你好"}]})
+    p.await_response(rid, timeout=30)
+    _, worker_pgid = _wait_worker_ids(p)
+
+    code, _ = p.close()
+    assert code == 0
+    assert not _pgid_alive(worker_pgid), "桥退出后 worker 进程组仍然存活"
+
+
+def test_worker_path_no_orphan_when_stdin_closes_mid_turn(peer):
+    """turn 在途时客户端直接断开 stdin：worker 不得变成孤儿。
+
+    这条路径上没有任何 session/cancel，桥只是发现 stdin EOF 就要退出——
+    在途 worker 的回收必须由关停兜底负责，而不是靠取消流程。
+    """
+    p = peer(
+        {"events": TEXT_EVENTS, "stall_before_first_yield_s": 30},
+        env_extra=WORKER_PATH_ENV,
+    )
+    p.initialize()
+    session_id = p.new_session()
+    p.send("session/prompt", {"sessionId": session_id, "prompt": [{"type": "text", "text": "你好"}]})
+    _, worker_pgid = _wait_worker_ids(p)
+    assert _pgid_alive(worker_pgid)
+
+    assert p.proc.stdin is not None
+    p.proc.stdin.close()
+    p.proc.wait(timeout=30)
+
+    deadline = time.time() + 10
+    while time.time() < deadline and _pgid_alive(worker_pgid):
+        time.sleep(0.1)
+    assert not _pgid_alive(worker_pgid), f"stdin 断连后 worker 进程组 {worker_pgid} 成了孤儿"
+
+
+def test_worker_path_no_orphan_after_sigterm_mid_turn(peer):
+    """桥收到 SIGTERM 时，在途 worker 进程组必须被回收。
+
+    worker 处在**独立**进程组，不会跟着桥的进程组一起收到信号；关停路径若不
+    显式回收，它会继续跑完整个模型调用。
+    """
+    p = peer(
+        {"events": TEXT_EVENTS, "stall_before_first_yield_s": 30},
+        env_extra={**WORKER_PATH_ENV, "DEERFLOW_ACP_SHUTDOWN_GRACE_SECONDS": "0.5"},
+    )
+    p.initialize()
+    session_id = p.new_session()
+    p.send("session/prompt", {"sessionId": session_id, "prompt": [{"type": "text", "text": "你好"}]})
+    _, worker_pgid = _wait_worker_ids(p)
+    assert _pgid_alive(worker_pgid)
+
+    p.proc.send_signal(signal.SIGTERM)
+    p.proc.wait(timeout=30)
+
+    deadline = time.time() + 10
+    while time.time() < deadline and _pgid_alive(worker_pgid):
+        time.sleep(0.1)
+    assert not _pgid_alive(worker_pgid), f"SIGTERM 后 worker 进程组 {worker_pgid} 成了孤儿"
 
 
 # ----------------------------------------------------------------------

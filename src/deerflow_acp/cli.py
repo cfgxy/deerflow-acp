@@ -19,6 +19,7 @@ from typing import IO, Any
 from . import __version__
 from .config import BridgeConfig
 from .logging_setup import configure_logging, get_logger, redirect_root_logging_to_stderr
+from .sanitize import describe_exception, redact_text
 
 logger = get_logger("cli")
 
@@ -119,7 +120,19 @@ async def _stdio_streams(protocol_stdout: IO[bytes]) -> tuple[asyncio.StreamRead
     return reader, writer
 
 
-async def serve(config: BridgeConfig, protocol_stdout: IO[bytes]) -> int:
+async def serve(
+    config: BridgeConfig,
+    protocol_stdout: IO[bytes],
+    *,
+    backend: Any = None,
+    runner: Any = None,
+) -> int:
+    """在 stdio 上跑 ACP server。
+
+    ``backend`` / ``runner`` 只为契约测试注入替身而存在；生产路径两者都为 None，
+    由 agent 自行选取嵌入式后端与 worker 子进程执行器。测试必须能走**这个**函数，
+    否则信号处理与 worker 回收这些只存在于关停路径上的行为无从验证。
+    """
     import acp
 
     from .agent import DeerFlowAgent
@@ -127,7 +140,7 @@ async def serve(config: BridgeConfig, protocol_stdout: IO[bytes]) -> int:
     agent_holder: dict[str, DeerFlowAgent] = {}
 
     def to_agent(connection: Any) -> DeerFlowAgent:
-        agent = DeerFlowAgent(connection, config=config)
+        agent = DeerFlowAgent(connection, config=config, backend=backend, runner=runner)
         agent_holder["agent"] = agent
         return agent
 
@@ -160,13 +173,22 @@ async def serve(config: BridgeConfig, protocol_stdout: IO[bytes]) -> int:
 
     await asyncio.wait({serve_task, shutdown_task}, return_when=asyncio.FIRST_COMPLETED)
 
+    def reap_workers() -> None:
+        agent = agent_holder.get("agent")
+        if agent is not None:
+            agent.registry.terminate_all_workers()
+
     if serve_task.done():
         shutdown_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await shutdown_task
+        # stdin EOF 正常退出这条路也要收：客户端可以在 turn 在途时直接断开。
+        reap_workers()
         exc = serve_task.exception()
         if exc is not None:
-            logger.error("ACP server 异常退出：%s", type(exc).__name__, exc_info=exc)
+            # 不用 exc_info：traceback 与异常消息都可能夹带凭据，而 stderr 是
+            # 客户端可见的输出面。类型名足以区分故障类别。
+            logger.error("ACP server 异常退出：%s", describe_exception(exc))
             return 1
         logger.info("stdin 已断开，ACP server 正常退出")
         return 0
@@ -178,6 +200,8 @@ async def serve(config: BridgeConfig, protocol_stdout: IO[bytes]) -> int:
     serve_task.cancel()
     with contextlib.suppress(asyncio.CancelledError, Exception):
         await serve_task
+    # 宽限期已过、任务已取消，仍活着的 worker 只能强制回收——桥马上就退出了。
+    reap_workers()
     return 0
 
 
@@ -192,7 +216,10 @@ def _doctor(config: BridgeConfig) -> int:
         # 用一个必然不存在的 thread id 触发完整的客户端初始化 + checkpointer 访问。
         backend.thread_exists("deerflow-acp-doctor-probe")
     except BackendUnavailableError as exc:
-        print(f"DeerFlow 运行时不可用：{exc}", file=sys.stderr)
+        # BackendUnavailableError 的消息本身已在 backend.py 里压成类型名，
+        # 这里再过一次 redact_text 是纵深防御：doctor 是人工排障入口，
+        # 但它的输出常被贴进 issue 与工单。
+        print(f"DeerFlow 运行时不可用：{redact_text(exc)}", file=sys.stderr)
         return 1
     print("DeerFlow 运行时可用", file=sys.stderr)
     return 0

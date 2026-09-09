@@ -36,7 +36,7 @@ DeerFlow harness **不在** `dependencies` 中。它不在任何公开索引上�
 | `session/load` | 支持 | 恢复会话并**重放**历史消息 |
 | `session/resume` | 支持（unstable） | 恢复会话，**不重放**——Multica 客户端已持有本地记录，重放会造成 UI 重复 |
 | `session/prompt` | 支持 | 仅接受 `text` 内容块 |
-| `session/cancel` | 支持 | 通知型，协作式取消；未知 sessionId 静默忽略（无响应通道） |
+| `session/cancel` | 支持 | 通知型。先向 worker 进程组发 `SIGTERM` 请求协作退出，宽限期超时后 `killpg(SIGKILL)`；未知 sessionId 静默忽略（无响应通道） |
 | `session/close` | 支持（unstable） | 释放注册表条目，DeerFlow checkpoint 保留 |
 | `authenticate` | **不支持** | `-32601`。凭据由 DeerFlow 本地机制注入，桥不参与认证 |
 | `session/set_mode` | **不支持** | `-32601` |
@@ -133,17 +133,22 @@ ACP `usage_update` 的 `size` / `used` 表示**上下文窗口占用**；DeerFlo
 | `stopReason` | 触发条件 |
 | --- | --- |
 | `end_turn` | 正常结束 |
-| `cancelled` | 收到 `session/cancel`。宽限期由事件循环侧计时，**不依赖工作线程报到**：后端卡在下一个 yield 之前（模型/工具调用未返回）时同样在 `CANCEL_GRACE_SECONDS` 内返回。工作线程未在宽限期内收敛时仍返回 `cancelled`，但标记 `escalated` 并在 stderr 记警告——不伪装成干净收敛。被弃用的工作线程持有本轮专属的取消标志与队列，不干扰同一 session 的后续 turn |
+| `cancelled` | 收到 `session/cancel`。宽限期由事件循环侧计时，**不依赖 worker 报到**：后端卡在下一个 yield 之前（模型/工具调用未返回）时同样在 `CANCEL_GRACE_SECONDS` 内返回。worker 未在宽限期内协作退出时 `killpg(SIGKILL)` 终止整个进程组，**等到进程确认被回收后才返回**并标记 `escalated`（stderr 记警告，不伪装成干净收敛）。因此「宽限期已过」之后不可能再出现晚到的 `session/update`、checkpoint 写入或工具副作用 |
 | `refusal` | 后端 `stream()` 抛异常 |
 
 ## 进程与流
 
 | 项 | 保证 |
 | --- | --- |
-| stdout | 仅 JSON-RPC。fd 级隔离：`dup(1)` 出协议专用 fd 后 `dup2(2, 1)`，进程内任何写 fd 1 的代码（含 C 扩展裸 `write`）都落 stderr |
-| stderr | 全部日志。级别由 `DEERFLOW_ACP_LOG_LEVEL` 控制 |
-| stdin EOF | 退出码 0 |
-| `SIGINT` / `SIGTERM` | 先给活跃会话置取消标志，宽限 `SHUTDOWN_GRACE_SECONDS` 后强制退出；退出后无残留子进程 |
+| 执行载体 | 每个 turn 一个 worker 子进程（`python -m deerflow_acp.worker`），`start_new_session=True` 置于独立进程组。worker 内用**嵌入式** `DeerFlowClient`，不是 CLI 文本包装 |
+| 桥 ↔ worker | 单向 ndJSON over worker stdout，4 种消息：`ready` / `ev` / `done` / `err`。job 载荷经 worker stdin 下发，只含 `session_id` / `message` / `thread_id` 与非凭据配置字段 |
+| stdout（桥） | 仅 JSON-RPC。fd 级隔离：`dup(1)` 出协议专用 fd 后 `dup2(2, 1)`，进程内任何写 fd 1 的代码（含 C 扩展裸 `write`）都落 stderr |
+| stdout（worker） | 仅 ndJSON IPC。worker 内做同样的 `dup`/`dup2` 隔离，因此 DeerFlow 或任何 provider SDK 的 `print` 不会撕裂 IPC 通道，更不会接到 ACP 协议 fd 上 |
+| stderr | 全部日志（桥与 worker 同流）。级别由 `DEERFLOW_ACP_LOG_LEVEL` 控制 |
+| 跨进程异常 | 只传 `type(exc).__name__`。异常消息、`args`、`__cause__` 与 traceback 一律不过 IPC 边界，因此凭据即使被塞进异常消息也到不了桥进程或客户端 |
+| stdin EOF | 退出码 0；在途 worker 进程组被强制回收后才退出 |
+| `SIGINT` / `SIGTERM` | 先给活跃会话置取消标志，宽限 `SHUTDOWN_GRACE_SECONDS`；超时后取消在途 turn 协程并强制回收所有在途 worker 进程组 |
+| 孤儿进程 | 双闸冗余：① turn 协程被中断时在 `except BaseException` 内**同步** `killpg`（`await` 在取消传播期间可能再被打断，同步系统调用不会）；② 关停路径再调 `terminate_all_workers()` 兜底。两闸互为冗余——缺任一仍不产生孤儿，同时缺失才会漏 |
 
 ## 已知限制
 
@@ -158,6 +163,15 @@ ACP `usage_update` 的 `size` / `used` 表示**上下文窗口占用**；DeerFlo
 7. **DeerFlow 按 cwd 定位 `config.yaml`**。当前版本 `DeerFlowClient(config_path=...)`
    不改变查找根，桥进程必须在 DeerFlow 部署根目录下启动（E2E 测试以
    `DEERFLOW_ACP_E2E_CWD` 指定，默认 `/home/guxy/srv/deerflow`）。
+8. **强杀点上的 checkpoint 粒度由 DeerFlow 决定**。`killpg` 是在任意指令边界
+   打断进程，桥不参与 checkpoint 写入；恢复到的是 LangGraph 最后一次成功
+   持久化的节点，被打断节点内的进展会丢失。桥保证的是「能从 checkpoint
+   继续且不与旧 worker 并发」，不是「不丢任何 token」。
+9. **每 turn 一次进程启动开销**。worker 需重新 import DeerFlow 与模型 SDK，
+   首个事件前有固定延迟。这是换取可终止性的代价，属已知设计取舍。
+10. **`InProcessTurnRunner` 没有强制终止能力**。它只服务于把后端对象直接注入
+    的单元测试（Python 对象跨不过进程边界）；宽限期超时后只能弃用工作线程。
+    **它不在生产路径上**——`deerflow-acp acp` 一律使用 `SubprocessTurnRunner`。
 
 ## 回退路径
 
