@@ -479,3 +479,127 @@ def test_sigterm_terminates_without_orphan_children(peer):
         ["pgrep", "-P", str(p.proc.pid)], capture_output=True, text=True
     )
     assert children.stdout.strip() == ""
+
+
+# ----------------------------------------------------------------------
+# 取消：后端卡在第一个 yield 之前（真子进程）
+# ----------------------------------------------------------------------
+
+# 构造的假秘密：形态逼真但完全无效
+CONTRACT_FAKE_KEY = "sk-proj-Ab3xQ9zK7mNpR2vT5wY8cE1dF4gH6jL0oP"
+CONTRACT_FAKE_DSN = "postgres://dfuser:Sup3rS3cretPw@127.0.0.1:5432/deerflow"
+
+
+def test_cancel_returns_within_grace_when_backend_stalls_before_first_yield(peer):
+    """最难的一种取消：后端卡在 next(generator) 内部，永远到不了 yield 边界。
+
+    没有事件循环侧计时的话，session/prompt 会永久挂起——这正是宽限期存在的理由。
+    """
+    p = peer(
+        {"events": TEXT_EVENTS, "stall_before_first_yield_s": 30},
+        env_extra={"DEERFLOW_ACP_CANCEL_GRACE_SECONDS": "0.5"},
+    )
+    p.initialize()
+    session_id = p.new_session()
+
+    rid = p.send("session/prompt", {"sessionId": session_id, "prompt": [{"type": "text", "text": "你好"}]})
+    time.sleep(0.3)  # 让 turn 真的进到后端阻塞里
+    p.send("session/cancel", {"sessionId": session_id}, notification=True)
+
+    started = time.time()
+    resp = p.await_response(rid, timeout=10)
+    elapsed = time.time() - started
+
+    assert resp["result"]["stopReason"] == "cancelled"
+    assert elapsed < 8, f"取消后 {elapsed:.1f}s 才返回，宽限期没有生效"
+
+    p.proc.kill()
+    p.proc.wait(timeout=5)
+
+
+def test_session_reusable_after_stalled_cancel(peer):
+    """被弃用的旧 worker 不得让同一 session 的后续 prompt 一直吃 -32011。"""
+    p = peer(
+        {"events": TEXT_EVENTS, "stall_before_first_yield_s": 3},
+        env_extra={"DEERFLOW_ACP_CANCEL_GRACE_SECONDS": "0.5"},
+    )
+    p.initialize()
+    session_id = p.new_session()
+
+    rid = p.send("session/prompt", {"sessionId": session_id, "prompt": [{"type": "text", "text": "第一问"}]})
+    time.sleep(0.3)
+    p.send("session/cancel", {"sessionId": session_id}, notification=True)
+    first = p.await_response(rid, timeout=10)
+    assert first["result"]["stopReason"] == "cancelled"
+
+    # 同一 session 立刻再来一轮：不得被判为「turn 正在执行」
+    rid2 = p.send("session/prompt", {"sessionId": session_id, "prompt": [{"type": "text", "text": "第二问"}]})
+    second = p.await_response(rid2, timeout=20)
+    assert "error" not in second, f"后续 turn 被旧 worker 拖累：{second.get('error')}"
+    assert second["result"]["stopReason"] == "end_turn"
+
+    p.proc.kill()
+    p.proc.wait(timeout=5)
+
+
+# ----------------------------------------------------------------------
+# 秘密不出进程：JSON-RPC 与 stderr 双通道（真子进程）
+# ----------------------------------------------------------------------
+
+
+def test_secret_never_reaches_jsonrpc_or_stderr_on_backend_error(peer):
+    p = peer({"events": TEXT_EVENTS, "raise": f"provider 拒绝：{CONTRACT_FAKE_KEY}"})
+    p.initialize()
+    session_id = p.new_session()
+
+    rid = p.send("session/prompt", {"sessionId": session_id, "prompt": [{"type": "text", "text": "你好"}]})
+    resp = p.await_response(rid)
+
+    wire = json.dumps(resp, ensure_ascii=False)
+    assert CONTRACT_FAKE_KEY not in wire
+    assert "RuntimeError" in wire, "脱敏不得把错误分类也抹掉，否则不可诊断"
+
+    _code, stderr = p.close()
+    assert CONTRACT_FAKE_KEY not in stderr, "秘密从 stderr 漏出去了"
+
+
+def test_secret_never_reaches_jsonrpc_on_backend_unavailable(peer):
+    p = peer({"events": TEXT_EVENTS, "raise_backend_unavailable": f"连不上 {CONTRACT_FAKE_DSN}"})
+    p.initialize()
+    session_id = p.new_session()
+
+    rid = p.send("session/prompt", {"sessionId": session_id, "prompt": [{"type": "text", "text": "你好"}]})
+    resp = p.await_response(rid)
+
+    wire = json.dumps(resp, ensure_ascii=False)
+    assert "Sup3rS3cretPw" not in wire
+    assert resp["error"]["code"] == -32010
+
+    _code, stderr = p.close()
+    assert "Sup3rS3cretPw" not in stderr
+
+
+def test_secret_in_custom_event_never_reaches_client(peer):
+    """custom 事件里的 error/reason 会变成客户端可见文本，必须先脱敏。"""
+    p = peer(
+        {
+            "events": [
+                ["custom", {"type": "llm_retry", "attempt": 1, "max_attempts": 3,
+                            "reason": f"401，Authorization: Bearer {CONTRACT_FAKE_KEY}"}],
+                ["end", {"usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2}}],
+            ]
+        }
+    )
+    p.initialize()
+    session_id = p.new_session()
+
+    rid = p.send("session/prompt", {"sessionId": session_id, "prompt": [{"type": "text", "text": "你好"}]})
+    resp = p.await_response(rid)
+
+    wire = json.dumps(resp, ensure_ascii=False)
+    assert CONTRACT_FAKE_KEY not in wire
+    # 重试次数仍要看得见
+    assert "1/3" in wire or ("1" in wire and "3" in wire)
+
+    _code, stderr = p.close()
+    assert CONTRACT_FAKE_KEY not in stderr

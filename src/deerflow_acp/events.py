@@ -25,6 +25,7 @@ from acp.helpers import (
 from acp.schema import AgentMessageChunk, AgentThoughtChunk, ToolCallStart, ToolCallProgress, ToolKind
 
 from .logging_setup import get_logger
+from .sanitize import redact_text
 
 logger = get_logger("events")
 
@@ -275,7 +276,8 @@ class EventNormalizer:
         if not task_id:
             return []
         error = data.get("error")
-        content = [tool_content(text_block(str(error)))] if error else None
+        # 后端把上游报错原文塞进 error 是常态，先脱敏再交给客户端。
+        content = [tool_content(text_block(redact_text(error)))] if error else None
         updates: list[SessionUpdate] = []
         if task_id not in self._announced_tools:
             self._announced_tools[task_id] = "task"
@@ -287,7 +289,7 @@ class EventNormalizer:
 def _format_retry_notice(data: dict[str, Any]) -> str:
     attempt = data.get("attempt")
     max_attempts = data.get("max_attempts")
-    reason = data.get("reason") or "未提供原因"
+    reason = redact_text(data.get("reason")) or "未提供原因"
     wait_ms = data.get("wait_ms")
     parts = ["[DeerFlow] 模型调用重试"]
     if attempt is not None and max_attempts is not None:
@@ -299,7 +301,7 @@ def _format_retry_notice(data: dict[str, Any]) -> str:
 
 
 def _format_safety_notice(data: dict[str, Any]) -> str:
-    reason = data.get("reason") or data.get("finish_reason") or "未提供原因"
+    reason = redact_text(data.get("reason") or data.get("finish_reason")) or "未提供原因"
     suppressed = data.get("suppressed_tool_calls") or data.get("suppressed_names")
     text = f"[DeerFlow] 安全策略提前终止本轮工具调用：{reason}"
     if isinstance(suppressed, Iterable) and not isinstance(suppressed, (str, bytes)):

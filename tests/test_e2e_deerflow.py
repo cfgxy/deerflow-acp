@@ -27,6 +27,10 @@ pytestmark = pytest.mark.skipif(
 # 真实模型调用比契约测试慢一个数量级
 TURN_TIMEOUT = float(os.environ.get("DEERFLOW_ACP_E2E_TIMEOUT", "300"))
 
+# DeerFlow 只按**当前工作目录**查找 config.yaml（构造函数的 config_path 参数
+# 在当前版本并不改变查找根），因此桥子进程必须在 DeerFlow 部署根下启动。
+DEERFLOW_ROOT = os.environ.get("DEERFLOW_ACP_E2E_CWD", "/home/guxy/srv/deerflow")
+
 
 class Bridge:
     def __init__(self, proc: subprocess.Popen) -> None:
@@ -104,6 +108,7 @@ def bridge():
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            cwd=DEERFLOW_ROOT,
             env={**os.environ, "PYTHONUNBUFFERED": "1"},
         )
         b = Bridge(proc)

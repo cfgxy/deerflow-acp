@@ -65,6 +65,25 @@ Multica 的续会话请求会直接收到 `-32601`。这是硬需求，不是可
 「未知会话」与「后端故障」严格分账：checkpointer 自身报错不得伪装成
 「这个 session 不存在」，否则客户端会误以为历史丢失而新开会话。
 
+## 秘密脱敏
+
+桥无法预知 DeerFlow、LangGraph 或某个 provider SDK 会把什么塞进异常消息——
+把整个请求头（含 `Authorization`）或数据库连接串回显进报错是常见做法。因此
+**所有离开进程的文本**都先过 `deerflow_acp.sanitize.redact_text()`：
+
+| 输出面 | 处理 |
+| --- | --- |
+| JSON-RPC error `data` | `-32010` 的 `detail` 已脱敏；`-32603` 只给 `sessionId` + `errorType`（异常类型名） |
+| stderr 日志 | 不使用 `exc_info=`（会连 traceback 一起写出）；只记类型名与脱敏后的消息 |
+| 客户端可见事件 | custom task 的 `error`、`llm_retry.reason`、`safety_termination.reason` 均脱敏后再转成文本 |
+
+覆盖形态：provider key 前缀串（`sk-` / `ghp_` / `gsk-` / `AKIA…`）、JWT、
+`Authorization: Bearer`、`key=value` 形态的 token/secret/password/credential、
+URL userinfo、≥32 位裸十六进制串、PEM 私钥块。
+
+脱敏保留诊断价值：host:port、异常类型、重试次数、认证方案名不被抹掉——
+否则等于用「不可诊断」换「不泄露」。
+
 ## 客户端能力
 
 桥在 `initialize` 中声明：
@@ -114,7 +133,7 @@ ACP `usage_update` 的 `size` / `used` 表示**上下文窗口占用**；DeerFlo
 | `stopReason` | 触发条件 |
 | --- | --- |
 | `end_turn` | 正常结束 |
-| `cancelled` | 收到 `session/cancel`。若工作线程在宽限期内未收敛，仍返回 `cancelled`，但在 stderr 记 `escalated` 警告——不伪装成干净收敛 |
+| `cancelled` | 收到 `session/cancel`。宽限期由事件循环侧计时，**不依赖工作线程报到**：后端卡在下一个 yield 之前（模型/工具调用未返回）时同样在 `CANCEL_GRACE_SECONDS` 内返回。工作线程未在宽限期内收敛时仍返回 `cancelled`，但标记 `escalated` 并在 stderr 记警告——不伪装成干净收敛。被弃用的工作线程持有本轮专属的取消标志与队列，不干扰同一 session 的后续 turn |
 | `refusal` | 后端 `stream()` 抛异常 |
 
 ## 进程与流
@@ -134,6 +153,11 @@ ACP `usage_update` 的 `size` / `used` 表示**上下文窗口占用**；DeerFlo
 3. **模型在进程生命周期内固定**。`session/set_model` 不支持，换模型需重启桥。
 4. **`session/fork` 不支持**。DeerFlow checkpointer 无对应语义。
 5. **凭据完全交给 DeerFlow**。桥不读、不存、不转发任何 API key。
+6. **脱敏是启发式的**。基于形态匹配，不可能覆盖全部秘密形态；它是最后一道
+   兜底，不替代「不要把秘密放进异常消息」这条上游纪律。
+7. **DeerFlow 按 cwd 定位 `config.yaml`**。当前版本 `DeerFlowClient(config_path=...)`
+   不改变查找根，桥进程必须在 DeerFlow 部署根目录下启动（E2E 测试以
+   `DEERFLOW_ACP_E2E_CWD` 指定，默认 `/home/guxy/srv/deerflow`）。
 
 ## 回退路径
 

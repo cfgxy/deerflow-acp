@@ -25,10 +25,11 @@ flowchart LR
 | --- | --- |
 | 会话映射 | ACP `sessionId` **就是** DeerFlow `thread_id`（同一字符串），桥不维护额外映射表 |
 | 会话恢复 | 以 `DeerFlowClient.get_thread()` 是否返回 checkpoint 为唯一依据；不存在则报错，绝不静默新建 |
-| 取消 | 协作式：置标志 → 工作线程在下一个 yield 边界 `generator.close()`；超宽限期如实标记升级 |
+| 取消 | 协作式优先：置标志 → 工作线程在下一个 yield 边界 `generator.close()`。宽限期由**事件循环侧**计时，因此后端即使卡在 yield **之前**（模型/工具调用还没返回），`session/prompt` 仍在宽限期内返回 `cancelled` 并标记 `escalated`；卡住的工作线程被弃用，不影响同一 session 的后续 turn |
 | stdout 纪律 | 启动时 `dup(1)` 出协议专用 fd，再把 fd 1 重定向到 fd 2；任何 `print` 物理上无法污染协议流 |
 | 后端加载 | `initialize` 只回能力，不构造 `DeerFlowClient`；重型后端在首个真实请求时才拉起 |
 | 凭据 | 桥不存储、不打印、不上传任何秘密；完全沿用 DeerFlow 既有的本地 `.env` 注入机制 |
+| 秘密脱敏 | 所有离开进程的文本（JSON-RPC 响应体、stderr 日志、客户端可见事件）统一过 `sanitize.redact_text()`；对外错误只保留异常**类型名**等可诊断分类，不回显异常消息、traceback 与配置内容 |
 
 ## 安装
 

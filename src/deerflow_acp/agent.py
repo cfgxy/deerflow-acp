@@ -32,6 +32,7 @@ from .backend import BackendUnavailableError, DeerFlowBackend, EmbeddedDeerFlowB
 from .config import BridgeConfig
 from .events import EventNormalizer
 from .logging_setup import get_logger
+from .sanitize import describe_exception, redact_text
 from .session import (
     Session,
     SessionIdError,
@@ -216,18 +217,27 @@ class DeerFlowAgent:
                 {"sessionId": session_id},
             ) from None
         except BackendUnavailableError as exc:
-            raise RequestError(ERROR_BACKEND_UNAVAILABLE, "DeerFlow 后端不可用", {"detail": str(exc)}) from None
+            raise RequestError(
+                ERROR_BACKEND_UNAVAILABLE, "DeerFlow 后端不可用", {"detail": redact_text(exc)}
+            ) from None
 
         if outcome.error is not None:
             if isinstance(outcome.error, BackendUnavailableError):
                 raise RequestError(
                     ERROR_BACKEND_UNAVAILABLE,
                     "DeerFlow 后端不可用",
-                    {"detail": str(outcome.error)},
+                    {"detail": redact_text(outcome.error)},
                 ) from None
             # 后端异常已经中止了本轮；把可诊断分类交给客户端，
             # 但不回显 traceback 与配置内容（可能含路径与秘密）。
-            logger.error("会话 %s 的 turn 执行失败", session_id, exc_info=outcome.error)
+            # stderr 同样是客户端可见的输出面：绝不能用 exc_info=——那会把
+            # 未经脱敏的异常消息和整条 traceback 直接写出去。
+            logger.error(
+                "会话 %s 的 turn 执行失败：%s（%s）",
+                session_id,
+                describe_exception(outcome.error),
+                redact_text(outcome.error),
+            )
             raise RequestError(
                 RequestError.internal_error().code,
                 "DeerFlow turn 执行失败",
@@ -296,7 +306,9 @@ class DeerFlowAgent:
                 {"sessionId": session_id},
             ) from None
         except BackendUnavailableError as exc:
-            raise RequestError(ERROR_BACKEND_UNAVAILABLE, "DeerFlow 后端不可用", {"detail": str(exc)}) from None
+            raise RequestError(
+                ERROR_BACKEND_UNAVAILABLE, "DeerFlow 后端不可用", {"detail": redact_text(exc)}
+            ) from None
 
     async def _replay_history(self, session: Session) -> None:
         """``session/load`` 时把历史消息重放为 session updates。"""
@@ -306,7 +318,9 @@ class DeerFlowAgent:
         try:
             messages = await asyncio.to_thread(history_fn, session.session_id)
         except BackendUnavailableError as exc:
-            raise RequestError(ERROR_BACKEND_UNAVAILABLE, "DeerFlow 后端不可用", {"detail": str(exc)}) from None
+            raise RequestError(
+                ERROR_BACKEND_UNAVAILABLE, "DeerFlow 后端不可用", {"detail": redact_text(exc)}
+            ) from None
 
         for message in messages:
             kind = message.get("type")

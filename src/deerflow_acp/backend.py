@@ -17,6 +17,7 @@ from typing import Any, Protocol, runtime_checkable
 
 from .config import BridgeConfig
 from .logging_setup import get_logger
+from .sanitize import describe_exception
 
 logger = get_logger("backend")
 
@@ -59,7 +60,7 @@ class EmbeddedDeerFlowBackend:
             # 注意入口在 ``deerflow.client``，``deerflow`` 顶层不导出该符号。
             from deerflow.client import DeerFlowClient
         except Exception as exc:  # noqa: BLE001 —— 上游可能抛任意导入期异常
-            raise BackendUnavailableError(f"无法导入 DeerFlow 运行时：{type(exc).__name__}") from exc
+            raise BackendUnavailableError(f"无法导入 DeerFlow 运行时：{describe_exception(exc)}") from exc
 
         kwargs: dict[str, Any] = dict(self._config.client_extra)
         if self._config.deerflow_config_path:
@@ -71,8 +72,9 @@ class EmbeddedDeerFlowBackend:
         try:
             self._client = DeerFlowClient(**kwargs)
         except Exception as exc:  # noqa: BLE001
-            # 只暴露异常类型与消息，不回显配置内容——配置里可能带秘密。
-            raise BackendUnavailableError(f"DeerFlowClient 初始化失败：{type(exc).__name__}: {exc}") from exc
+            # 只暴露异常类型，不回显消息与配置内容——两者都可能带秘密。
+            # 完整异常仍挂在 __cause__ 上，本地排障时可取。
+            raise BackendUnavailableError(f"DeerFlowClient 初始化失败：{describe_exception(exc)}") from exc
         logger.info("DeerFlowClient 已初始化")
         return self._client
 
@@ -90,7 +92,7 @@ class EmbeddedDeerFlowBackend:
         except Exception as exc:  # noqa: BLE001
             # checkpointer 后端异常与「线程不存在」必须分账：这里如实上抛，
             # 由调用方转成 internal error，而不是伪装成「未知会话」。
-            raise BackendUnavailableError(f"读取 DeerFlow thread 失败：{type(exc).__name__}: {exc}") from exc
+            raise BackendUnavailableError(f"读取 DeerFlow thread 失败：{describe_exception(exc)}") from exc
         checkpoints = thread.get("checkpoints") if isinstance(thread, dict) else None
         return [cp for cp in checkpoints if isinstance(cp, dict)] if isinstance(checkpoints, list) else []
 

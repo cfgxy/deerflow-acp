@@ -28,7 +28,9 @@ class ScriptedBackend:
           "threads": {"df-known": [{"type": "ai", "content": "..."}]},
           "delay_ms": 0,           # 每个事件之间的间隔，用于制造取消窗口
           "repeat": 1,             # events 重复次数
-          "raise": "RuntimeError"  # 若设置，stream 立即抛该异常
+          "raise": "RuntimeError", # 若设置，stream 立即抛该异常（消息为此字符串）
+          "raise_backend_unavailable": "...",  # 改抛 BackendUnavailableError
+          "stall_before_first_yield_s": 0      # 在第一个 yield 之前阻塞这么久
         }
     """
 
@@ -38,15 +40,25 @@ class ScriptedBackend:
         self._delay = float(script.get("delay_ms", 0)) / 1000.0
         self._repeat = int(script.get("repeat", 1))
         self._raise = script.get("raise")
+        self._raise_unavailable = script.get("raise_backend_unavailable")
+        # 模拟「模型/工具调用卡在 next(generator) 内部」：阻塞点在第一个 yield 之前，
+        # 工作线程既看不到取消标志，也发不出完成信号
+        self._stall = float(script.get("stall_before_first_yield_s", 0))
         # 通过一个文件标记生成器是否被 close()，让父进程可以断言协作式取消
         self._closed_marker = os.environ.get("DEERFLOW_ACP_FAKE_CLOSED_MARKER")
 
     def stream(self, message: str, *, thread_id: str) -> Iterator[tuple[str, dict[str, Any]]]:
+        if self._raise_unavailable:
+            from deerflow_acp.backend import BackendUnavailableError
+
+            raise BackendUnavailableError(self._raise_unavailable)
         if self._raise:
             raise RuntimeError(self._raise)
 
         def gen() -> Iterator[tuple[str, dict[str, Any]]]:
             try:
+                if self._stall:
+                    time.sleep(self._stall)
                 for _ in range(self._repeat):
                     for event_type, data in self._events:
                         if self._delay:
@@ -61,6 +73,10 @@ class ScriptedBackend:
         return gen()
 
     def thread_exists(self, thread_id: str) -> bool:
+        if self._raise_unavailable:
+            from deerflow_acp.backend import BackendUnavailableError
+
+            raise BackendUnavailableError(self._raise_unavailable)
         return thread_id in self._threads
 
     def history(self, thread_id: str) -> list[dict[str, Any]]:
