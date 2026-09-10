@@ -1,0 +1,31 @@
+[project]
+name = "deerflow-acp"
+version = "0.1.0"
+description = "DeerFlow 与 Multica 之间的独立 ACP(Agent Client Protocol) 桥接器"
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "MIT" }
+dependencies = [
+    "agent-client-protocol==0.9.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24",
+]
+
+[project.scripts]
+deerflow-acp = "deerflow_acp.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/deerflow_acp"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+filterwarnings = ["error::DeprecationWarning:deerflow_acp.*"]
