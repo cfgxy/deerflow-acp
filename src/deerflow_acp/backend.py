@@ -30,8 +30,19 @@ class BackendUnavailableError(RuntimeError):
 class DeerFlowBackend(Protocol):
     """桥所依赖的 DeerFlow 能力的最小面。"""
 
-    def stream(self, message: str, *, thread_id: str) -> Iterator[tuple[str, dict[str, Any]]]:
-        """产出 ``(event_type, data)`` 二元组；必须是可 ``close()`` 的生成器。"""
+    def stream(
+        self,
+        message: str,
+        *,
+        thread_id: str,
+        model_name: str | None = None,
+    ) -> Iterator[tuple[str, dict[str, Any]]]:
+        """产出 ``(event_type, data)`` 二元组；必须是可 ``close()`` 的生成器。
+
+        ``model_name`` 是本会话的逐轮模型覆盖：None 表示不覆盖，沿用后端
+        进程级默认——实现**不得**把 None 当作显式模型名传给 DeerFlow，
+        否则会把已配置的默认模型清掉。
+        """
         ...
 
     def thread_exists(self, thread_id: str) -> bool:
@@ -40,6 +51,10 @@ class DeerFlowBackend(Protocol):
 
     def history(self, thread_id: str) -> list[dict[str, Any]]:
         """返回最新 checkpoint 中已序列化的消息列表；无历史时返回空列表。"""
+        ...
+
+    def list_models(self) -> dict[str, Any]:
+        """返回 DeerFlow 模型清单（``ModelsListResponse`` 形态，含 ``models`` 键）。"""
         ...
 
 
@@ -80,9 +95,18 @@ class EmbeddedDeerFlowBackend:
 
     # ------------------------------------------------------------------
 
-    def stream(self, message: str, *, thread_id: str) -> Iterator[tuple[str, dict[str, Any]]]:
+    def stream(
+        self,
+        message: str,
+        *,
+        thread_id: str,
+        model_name: str | None = None,
+    ) -> Iterator[tuple[str, dict[str, Any]]]:
         client = self._ensure_client()
-        for event in client.stream(message, thread_id=thread_id):
+        # DeerFlow 的 stream(**kwargs) 支持逐轮 model_name 覆盖；None 时不传，
+        # 让 client 沿用它自己的默认（含构造期 DEERFLOW_ACP_MODEL 覆盖）。
+        kwargs: dict[str, Any] = {"model_name": model_name} if model_name else {}
+        for event in client.stream(message, thread_id=thread_id, **kwargs):
             yield event.type, dict(event.data or {})
 
     def _checkpoints(self, thread_id: str) -> list[dict[str, Any]]:
@@ -107,3 +131,11 @@ class EmbeddedDeerFlowBackend:
             if isinstance(messages, list) and messages:
                 return [m for m in messages if isinstance(m, dict)]
         return []
+
+    def list_models(self) -> dict[str, Any]:
+        client = self._ensure_client()
+        try:
+            data = client.list_models()
+        except Exception as exc:  # noqa: BLE001 —— 与 thread 读取同口径：如实上抛
+            raise BackendUnavailableError(f"读取 DeerFlow 模型清单失败：{describe_exception(exc)}") from exc
+        return data if isinstance(data, dict) else {}

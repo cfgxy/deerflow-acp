@@ -48,8 +48,12 @@ class ScriptedBackend:
         self._closed_marker = os.environ.get("DEERFLOW_ACP_FAKE_CLOSED_MARKER")
         # 往 fd 1 打垃圾，验证「后端污染 stdout」不会撕裂承载在 fd 1 上的通道
         self._pollute_stdout = bool(script.get("pollute_stdout"))
+        # 模型清单（DeerFlow ModelsListResponse 形态），供 session/set_model 校验
+        self._models = script.get("models")
+        # 故障注入：list_models 抛后端不可用，验证「清单不可得」的错误路径
+        self._models_unavailable = script.get("models_unavailable")
 
-    def stream(self, message: str, *, thread_id: str) -> Iterator[tuple[str, dict[str, Any]]]:
+    def stream(self, message: str, *, thread_id: str, model_name: str | None = None) -> Iterator[tuple[str, dict[str, Any]]]:
         if self._pollute_stdout:
             print("这行垃圾绝不能出现在 IPC 通道里")
             sys.stdout.write("再来一行\n")
@@ -88,6 +92,13 @@ class ScriptedBackend:
 
     def history(self, thread_id: str) -> list[dict[str, Any]]:
         return list(self._threads.get(thread_id, []))
+
+    def list_models(self) -> dict[str, Any]:
+        if self._models_unavailable:
+            from deerflow_acp.backend import BackendUnavailableError
+
+            raise BackendUnavailableError(self._models_unavailable)
+        return {"models": list(self._models or [])}
 
 
 def build_backend(config: Any) -> ScriptedBackend:

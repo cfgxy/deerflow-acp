@@ -373,7 +373,6 @@ async def test_usage_update_is_clamped_to_window():
     "call",
     [
         lambda a: a.set_session_mode("m", "s"),
-        lambda a: a.set_session_model("m", "s"),
         lambda a: a.set_config_option("k", "s", "v"),
         lambda a: a.fork_session(),
         lambda a: a.list_sessions(),
@@ -385,6 +384,151 @@ async def test_unsupported_methods_return_method_not_found(call):
     with pytest.raises(RequestError) as exc:
         await call(agent)
     assert exc.value.code == -32601
+
+
+# ----------------------------------------------------------------------
+# 模型选择：session/set_model 与 new_session 模型列表
+# ----------------------------------------------------------------------
+
+FAKE_MODELS = [
+    {"name": "basic", "model": "deepseek-chat", "display_name": "Basic", "description": "默认基础模型"},
+    {"name": "advanced", "model": "deepseek-reasoner", "display_name": "Advanced", "description": "高级推理模型", "supports_thinking": True},
+]
+
+
+async def test_set_session_model_unknown_session_errors():
+    agent, _ = make_agent(FakeBackend(models=FAKE_MODELS))
+    with pytest.raises(RequestError) as exc:
+        await agent.set_session_model("basic", "df-missing")
+    assert exc.value.code == ERROR_UNKNOWN_SESSION
+
+
+async def test_set_session_model_invalid_model_is_invalid_params_not_silent():
+    """无效模型必须显式报错，不允许静默接受。"""
+    agent, _ = make_agent(FakeBackend(models=FAKE_MODELS))
+    session_id = (await agent.new_session("/tmp")).session_id
+    with pytest.raises(RequestError) as exc:
+        await agent.set_session_model("no-such-model", session_id)
+    assert exc.value.code == -32602
+
+
+async def test_set_session_model_accepts_listed_model():
+    agent, _ = make_agent(FakeBackend(models=FAKE_MODELS))
+    session_id = (await agent.new_session("/tmp")).session_id
+    # ACP set_session_model 返回 None 或响应对象都合法，不应抛错
+    await agent.set_session_model("advanced", session_id)
+
+
+async def test_set_session_model_applies_to_next_turn():
+    """set 后的下一轮 turn 必须使用新模型；set 之前的轮次不受影响。"""
+    backend = FakeBackend(models=FAKE_MODELS)
+    agent, _ = make_agent(backend)
+    session_id = (await agent.new_session("/tmp")).session_id
+
+    await agent.prompt([text_block("第一轮")], session_id)
+    assert backend.model_calls == [None]
+
+    await agent.set_session_model("advanced", session_id)
+    await agent.prompt([text_block("第二轮")], session_id)
+    assert backend.model_calls == [None, "advanced"]
+
+
+async def test_model_override_is_per_session():
+    """模型覆盖只作用于设置它的会话，不泄漏到其他会话。"""
+    backend = FakeBackend(models=FAKE_MODELS)
+    agent, _ = make_agent(backend)
+    first = (await agent.new_session("/tmp")).session_id
+    second = (await agent.new_session("/tmp")).session_id
+
+    await agent.set_session_model("advanced", first)
+    await agent.prompt([text_block("hi")], first)
+    await agent.prompt([text_block("hi")], second)
+    assert backend.model_calls == ["advanced", None]
+
+
+async def test_new_session_response_carries_model_list():
+    """new_session 响应携带的模型清单必须与后端 list_models() 一致。"""
+    agent, _ = make_agent(FakeBackend(models=FAKE_MODELS))
+    resp = await agent.new_session("/tmp")
+
+    assert resp.models is not None
+    assert [(m.model_id, m.name, m.description) for m in resp.models.available_models] == [
+        ("basic", "Basic", "默认基础模型"),
+        ("advanced", "Advanced", "高级推理模型"),
+    ]
+    # 未显式配置默认模型时，当前模型取 DeerFlow 默认语义（清单第一项）
+    assert resp.models.current_model_id == "basic"
+
+
+async def test_new_session_current_model_reflects_configured_default():
+    """启动期配置了默认模型（DEERFLOW_ACP_MODEL）时，current_model_id 跟随它。"""
+    agent, _ = make_agent(FakeBackend(models=FAKE_MODELS), model_name="advanced")
+    resp = await agent.new_session("/tmp")
+    assert resp.models is not None
+    assert resp.models.current_model_id == "advanced"
+
+
+async def test_new_session_survives_model_list_failure():
+    """模型清单获取失败不得阻断会话创建：models 缺省，会话照常可用。"""
+    backend = FakeBackend(model_lookup_error=BackendUnavailableError("清单不可用"))
+    agent, _ = make_agent(backend)
+    resp = await agent.new_session("/tmp")
+    assert resp.session_id
+    assert resp.models is None
+
+
+async def test_set_session_model_with_backend_list_failure_is_rejected():
+    """无法取得模型清单时不能盲设模型——显式拒绝，不静默接受。"""
+    backend = FakeBackend(model_lookup_error=BackendUnavailableError("清单不可用"))
+    agent, _ = make_agent(backend)
+    session_id = (await agent.new_session("/tmp")).session_id
+    with pytest.raises(RequestError) as exc:
+        await agent.set_session_model("whatever", session_id)
+    assert exc.value.code == ERROR_BACKEND_UNAVAILABLE
+
+
+async def test_resumed_session_keeps_model_override_in_same_process():
+    """同进程内 resume 复用同一会话对象：模型覆盖保持。"""
+    backend = FakeBackend(models=FAKE_MODELS, threads={"df-known": [{"type": "ai", "content": "旧"}]})
+    agent, _ = make_agent(backend)
+    await agent.resume_session("/tmp", "df-known")
+    await agent.set_session_model("advanced", "df-known")
+
+    await agent.resume_session("/tmp", "df-known")
+    await agent.prompt([text_block("hi")], "df-known")
+    assert backend.model_calls == ["advanced"]
+
+
+async def test_resume_into_fresh_registry_falls_back_to_default_model():
+    """跨进程恢复（父进程重启、注册表重建）后无覆盖记录：回到默认模型。
+
+    这是显式选定的恢复语义：桥不持久化会话级模型状态，恢复后的会话
+    使用进程级默认（与「未 set 时行为与现状一致」同源），文档明示。
+    """
+    backend = FakeBackend(models=FAKE_MODELS, threads={"df-known": [{"type": "ai", "content": "旧"}]})
+    first_agent, _ = make_agent(backend)
+    await first_agent.resume_session("/tmp", "df-known")
+    await first_agent.set_session_model("advanced", "df-known")
+
+    fresh_agent, _ = make_agent(backend)
+    await fresh_agent.resume_session("/tmp", "df-known")
+    await fresh_agent.prompt([text_block("hi")], "df-known")
+    assert backend.model_calls[-1] is None
+
+
+async def test_backend_without_model_capability_still_serves_sessions():
+    """后端未提供模型清单能力时：new_session 不带 models，set_model 显式拒绝。"""
+
+    class NoModelsBackend(FakeBackend):
+        list_models = None  # type: ignore[assignment]
+
+    backend = NoModelsBackend()
+    agent, _ = make_agent(backend)
+    resp = await agent.new_session("/tmp")
+    assert resp.models is None
+
+    with pytest.raises(RequestError):
+        await agent.set_session_model("basic", resp.session_id)
 
 
 async def test_ext_notification_is_ignored_silently():

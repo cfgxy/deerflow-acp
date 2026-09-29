@@ -119,6 +119,11 @@ class Session:
     #: 一旦置上就不再清除：桥无法证明失控进程组已消失，唯一安全做法是永久拒绝
     #: 在这条 thread 上再开 turn。
     quarantined_pgid: int | None = None
+    #: 会话级模型覆盖（``session/set_model`` 写入）。注册表在父进程内存中，
+    #: worker 每轮重建，因此覆盖必须留在这里、由 payload 逐轮携带。
+    #: None = 未覆盖，沿用进程级默认（与既有行为一致）。
+    #: 跨进程恢复（父进程重启后 resume）不带此状态，显式回到默认模型。
+    model_override: str | None = None
     #: 会话在 turn 运行期间收到过 ``session/close``。turn 结束后才能真正摘除注册项，
     #: 否则客户端可以在旧 worker 还活着时 resume 回来发新 prompt。
     close_requested: bool = False
@@ -280,6 +285,8 @@ class SessionRegistry:
         session: Session,
         message: str,
         on_event: Any,
+        *,
+        model_name: str | None = None,
     ) -> TurnOutcome:
         """驱动一次 turn，把 DeerFlow 事件逐条交给 ``on_event`` 协程。
 
@@ -291,6 +298,8 @@ class SessionRegistry:
             session: 目标会话。
             message: 用户消息文本。
             on_event: ``async (event_type, data) -> None``，在事件循环中执行。
+            model_name: 本轮的模型覆盖（来自会话级 ``model_override``）；
+                None 表示沿用进程级默认。
         """
         if session.quarantined:
             raise SessionQuarantinedError(session.session_id, session.quarantined_pgid)
@@ -313,6 +322,7 @@ class SessionRegistry:
                 on_event=on_event,
                 cancel_event=cancel_event,
                 grace=grace,
+                model_name=model_name,
             )
         finally:
             # 释放 running 之前必须先问执行器：这一轮的进程组确认终结了吗？
