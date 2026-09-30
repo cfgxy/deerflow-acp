@@ -79,7 +79,8 @@ Multica 的 hermes backend 会无条件在 argv 末尾拼接 `acp`，所以在 M
 | 环境变量 | 默认 | 说明 |
 | --- | --- | --- |
 | `DEERFLOW_ACP_LOG_LEVEL` | `INFO` | 日志级别；日志**始终**写 stderr |
-| `DEERFLOW_ACP_CONFIG_PATH` | 空 | DeerFlow `config.yaml` 路径；空则由 DeerFlow 自行解析 |
+| `DEER_FLOW_CONFIG_PATH` | 空 | DeerFlow `config.yaml` 路径；空则由 DeerFlow 自行解析 |
+| `DEERFLOW_ACP_CONFIG_PATH` | 空 | 已废弃；仅在新变量未设置时作为兼容回退 |
 | `DEERFLOW_ACP_MODEL` | 空 | 覆盖 DeerFlow 默认模型名 |
 | `DEERFLOW_ACP_THINKING` | `true` | 是否请求模型输出推理内容（映射为 `agent_thought_chunk`） |
 | `DEERFLOW_ACP_CANCEL_GRACE_SECONDS` | `5` | 取消后等待 worker 协作退出的宽限期；超时即 `killpg(SIGKILL)` |

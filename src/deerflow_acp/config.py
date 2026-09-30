@@ -77,7 +77,7 @@ class BridgeConfig:
             context_window_tokens = None
 
         return cls(
-            deerflow_config_path=os.environ.get("DEERFLOW_ACP_CONFIG_PATH") or None,
+            deerflow_config_path=os.environ.get("DEER_FLOW_CONFIG_PATH") or os.environ.get("DEERFLOW_ACP_CONFIG_PATH") or None,
             model_name=os.environ.get("DEERFLOW_ACP_MODEL") or None,
             thinking_enabled=_env_flag("DEERFLOW_ACP_THINKING", True),
             cancel_grace_seconds=_env_float("DEERFLOW_ACP_CANCEL_GRACE_SECONDS", DEFAULT_CANCEL_GRACE_SECONDS),
