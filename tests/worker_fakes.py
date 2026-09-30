@@ -1,7 +1,7 @@
 """worker 子进程里加载的假 DeerFlow 后端。
 
-通过 ``DEERFLOW_ACP_WORKER_BACKEND=worker_fakes:build`` 注入，脚本从
-``DEERFLOW_ACP_FAKE_STATE`` 指向的目录读写状态。**它跑在真实的 worker 子进程里**，
+通过 ``DEER_FLOW_ACP_WORKER_BACKEND=worker_fakes:build`` 注入，脚本从
+``DEER_FLOW_ACP_FAKE_STATE`` 指向的目录读写状态。**它跑在真实的 worker 子进程里**，
 因此对它做的一切（阻塞、写副作用、写 checkpoint）都是真实的跨进程行为，
 不是父进程里的 mock 自洽。
 
@@ -26,13 +26,13 @@ from typing import Any
 
 
 def state_dir() -> Path:
-    return Path(os.environ["DEERFLOW_ACP_FAKE_STATE"])
+    return Path(os.environ["DEER_FLOW_ACP_FAKE_STATE"])
 
 
 class StatefulFakeBackend:
     """带持久状态与可观测副作用的假后端。
 
-    行为由 ``DEERFLOW_ACP_FAKE_STATE/script.json`` 控制::
+    行为由 ``DEER_FLOW_ACP_FAKE_STATE/script.json`` 控制::
 
         {
           "events": [["messages-tuple", {...}]],

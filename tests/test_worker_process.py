@@ -17,7 +17,7 @@ from typing import Any
 
 import pytest
 
-from deerflow_acp import ipc
+from deerflow_acp import ipc, worker
 
 REPO_TESTS = Path(__file__).parent
 
@@ -25,8 +25,8 @@ REPO_TESTS = Path(__file__).parent
 def spawn_worker(state: Path, thread_id: str, message: str = "问题") -> subprocess.Popen:
     env = {
         **os.environ,
-        "DEERFLOW_ACP_WORKER_BACKEND": "worker_fakes:build",
-        "DEERFLOW_ACP_FAKE_STATE": str(state),
+        "DEER_FLOW_ACP_WORKER_BACKEND": "worker_fakes:build",
+        "DEER_FLOW_ACP_FAKE_STATE": str(state),
         "PYTHONPATH": os.pathsep.join([str(REPO_TESTS), os.environ.get("PYTHONPATH", "")]).rstrip(os.pathsep),
         "PYTHONUNBUFFERED": "1",
     }
@@ -166,8 +166,8 @@ def test_worker_exits_on_stdin_eof_without_job(state: Path):
     """没有 job 就 EOF：worker 必须立刻退出，不得挂住。"""
     env = {
         **os.environ,
-        "DEERFLOW_ACP_WORKER_BACKEND": "worker_fakes:build",
-        "DEERFLOW_ACP_FAKE_STATE": str(state),
+        "DEER_FLOW_ACP_WORKER_BACKEND": "worker_fakes:build",
+        "DEER_FLOW_ACP_FAKE_STATE": str(state),
         "PYTHONPATH": os.pathsep.join([str(REPO_TESTS), os.environ.get("PYTHONPATH", "")]).rstrip(os.pathsep),
     }
     proc = subprocess.Popen(
@@ -213,3 +213,23 @@ def test_worker_close_error_does_not_leak_secret_to_stderr(state: Path):
     assert "关闭 DeerFlow 生成器时出错" in stderr, "该异常必须被记录，不能静默吞掉"
     assert "RuntimeError" in stderr, "必须保留异常类型"
     assert "Traceback" not in stderr, "不得输出 traceback"
+
+
+def test_backend_factory_env_precedence(monkeypatch: pytest.MonkeyPatch) -> None:
+    """WORKER_BACKEND 新名优先；旧前缀名仅作兼容回退。"""
+    cases = [
+        ("new_pkg:build", None, "new_pkg:build"),
+        (None, "legacy_pkg:build", "legacy_pkg:build"),
+        ("new_pkg:build", "legacy_pkg:build", "new_pkg:build"),
+        (None, None, None),
+    ]
+    for new_value, legacy_value, expected in cases:
+        for name, value in (
+            (worker.BACKEND_FACTORY_ENV, new_value),
+            (worker.BACKEND_FACTORY_ENV_LEGACY, legacy_value),
+        ):
+            if value is None:
+                monkeypatch.delenv(name, raising=False)
+            else:
+                monkeypatch.setenv(name, value)
+        assert worker._backend_factory_spec() == expected

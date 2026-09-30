@@ -40,7 +40,7 @@ DeerFlow harness **不在** `dependencies` 中。它不在任何公开索引上�
 | `session/close` | 支持（unstable） | 释放注册表条目，DeerFlow checkpoint 保留。**turn 在跑时延后生效**：只置取消标志，等在途 turn 确认 worker 进程组终结后才摘除条目（见「同 session 生命周期」） |
 | `authenticate` | **不支持** | `-32601`。凭据由 DeerFlow 本地机制注入，桥不参与认证 |
 | `session/set_mode` | **不支持** | `-32601` |
-| `session/set_model` | 支持（unstable） | 会话级模型覆盖，**下一轮 turn 生效**。覆盖存父进程注册表（每 turn 新建 worker，状态不能留 worker），由 worker payload 逐轮携带，落到 `DeerFlowClient.stream(..., model_name=...)` 逐轮覆盖能力；无效/未授权模型（不在 `list_models()` 清单内）返回 `-32602` 并附可用清单，不静默。同进程 `resume` 保持覆盖；跨进程恢复回到默认模型（桥不持久化会话级模型状态）。`DEERFLOW_ACP_MODEL` 仍是进程级默认，未 `set_model` 的会话行为与既往一致 |
+| `session/set_model` | 支持（unstable） | 会话级模型覆盖，**下一轮 turn 生效**。覆盖存父进程注册表（每 turn 新建 worker，状态不能留 worker），由 worker payload 逐轮携带，落到 `DeerFlowClient.stream(..., model_name=...)` 逐轮覆盖能力；无效/未授权模型（不在 `list_models()` 清单内）返回 `-32602` 并附可用清单，不静默。同进程 `resume` 保持覆盖；跨进程恢复回到默认模型（桥不持久化会话级模型状态）。`DEER_FLOW_ACP_MODEL` 仍是进程级默认，未 `set_model` 的会话行为与既往一致 |
 | `session/set_config_option` | **不支持** | `-32601` |
 | `session/fork` | **不支持** | `-32601`。DeerFlow checkpointer 无 fork 语义 |
 | `session/list` | **不支持** | `-32601`。桥不持久化会话清单 |
@@ -126,7 +126,7 @@ ACP `usage_update` 的 `size` / `used` 表示**上下文窗口占用**；DeerFlo
 | 场景 | 行为 |
 | --- | --- |
 | 默认 | 不发 `usage_update`；仅在 `PromptResponse.usage` 中如实回传 DeerFlow 给的 token 数 |
-| 设置 `DEERFLOW_ACP_CONTEXT_WINDOW_TOKENS` 且 `EMIT_USAGE_UPDATE=true` | 以该值为 `size`，累计 token 为 `used`（钳制到 `size`），近似上报 |
+| 设置 `DEER_FLOW_ACP_CONTEXT_WINDOW_TOKENS` 且 `EMIT_USAGE_UPDATE=true` | 以该值为 `size`，累计 token 为 `used`（钳制到 `size`），近似上报 |
 | usage 载荷畸形 | 忽略，不上报，不伪造 0 |
 
 ## 停止原因
@@ -145,7 +145,7 @@ ACP `usage_update` 的 `size` / `used` 表示**上下文窗口占用**；DeerFlo
 | 桥 ↔ worker | 单向 ndJSON over worker stdout，4 种消息：`ready` / `ev` / `done` / `err`。job 载荷经 worker stdin 下发，只含 `session_id` / `message` / `thread_id` 与非凭据配置字段 |
 | stdout（桥） | 仅 JSON-RPC。fd 级隔离：`dup(1)` 出协议专用 fd 后 `dup2(2, 1)`，进程内任何写 fd 1 的代码（含 C 扩展裸 `write`）都落 stderr |
 | stdout（worker） | 仅 ndJSON IPC。worker 内做同样的 `dup`/`dup2` 隔离，因此 DeerFlow 或任何 provider SDK 的 `print` 不会撕裂 IPC 通道，更不会接到 ACP 协议 fd 上 |
-| stderr | 全部日志（桥与 worker 同流）。级别由 `DEERFLOW_ACP_LOG_LEVEL` 控制 |
+| stderr | 全部日志（桥与 worker 同流）。级别由 `DEER_FLOW_ACP_LOG_LEVEL` 控制 |
 | 跨进程异常 | 只传 `type(exc).__name__`。异常消息、`args`、`__cause__` 与 traceback 一律不过 IPC 边界，因此凭据即使被塞进异常消息也到不了桥进程或客户端 |
 | stdin EOF | 退出码 0；在途 worker 进程组被强制回收后才退出 |
 | `SIGINT` / `SIGTERM` | 先给活跃会话置取消标志，宽限 `SHUTDOWN_GRACE_SECONDS`；超时后取消在途 turn 协程并强制回收所有在途 worker 进程组 |
@@ -177,7 +177,7 @@ checkpoint。桥用一条不变式守住这点：
    `session/close` 落在 turn 运行中时延后生效，见「同 session 生命周期」。
 3. **会话级模型覆盖不跨进程持久**。`session/set_model` 的覆盖保存在桥进程内存；
    同进程内 `session/resume` 保持覆盖，父进程重启后恢复的会话回到默认模型
-   （`DEERFLOW_ACP_MODEL` 或 DeerFlow 配置默认）。模型清单经 `new_session` 响应的
+   （`DEER_FLOW_ACP_MODEL` 或 DeerFlow 配置默认）。模型清单经 `new_session` 响应的
    `models` 字段（UNSTABLE）下发，数据取 DeerFlow `list_models()`；清单获取失败时
    会话创建不受阻，仅模型面缺省。
 4. **`session/fork` 不支持**。DeerFlow checkpointer 无对应语义。
@@ -186,7 +186,7 @@ checkpoint。桥用一条不变式守住这点：
    兜底，不替代「不要把秘密放进异常消息」这条上游纪律。
 7. **DeerFlow 按 cwd 定位 `config.yaml`**。当前版本 `DeerFlowClient(config_path=...)`
    不改变查找根，桥进程必须在 DeerFlow 部署根目录下启动（E2E 测试以
-   `DEERFLOW_ACP_E2E_CWD` 指定，默认 `/home/guxy/srv/deerflow`）。
+   `DEER_FLOW_ACP_E2E_CWD` 指定，默认 `/home/guxy/srv/deerflow`）。
 8. **强杀点上的 checkpoint 粒度由 DeerFlow 决定**。`killpg` 是在任意指令边界
    打断进程，桥不参与 checkpoint 写入；恢复到的是 LangGraph 最后一次成功
    持久化的节点，被打断节点内的进展会丢失。桥保证的是「能从 checkpoint

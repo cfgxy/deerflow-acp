@@ -36,7 +36,9 @@ logger = get_logger("worker")
 
 #: 允许测试把后端换成脚本化替身。值形如 ``module:callable``，
 #: 该 callable 接受 BridgeConfig 返回 DeerFlowBackend。生产路径不设此变量。
-BACKEND_FACTORY_ENV = "DEERFLOW_ACP_WORKER_BACKEND"
+BACKEND_FACTORY_ENV = "DEER_FLOW_ACP_WORKER_BACKEND"
+#: 已废弃的旧前缀名，仅在新名未设置时兼容回退。
+BACKEND_FACTORY_ENV_LEGACY = "DEERFLOW_ACP_WORKER_BACKEND"
 
 #: 收到 SIGTERM 后置位；只在信号处理器里做这一件事（信号处理器里不能做别的）
 _stopping = False
@@ -59,8 +61,13 @@ def _isolate_ipc_fd() -> IO[bytes]:
     return os.fdopen(ipc_fd, "wb", buffering=0)
 
 
+def _backend_factory_spec() -> str | None:
+    """新名优先；旧 ``DEERFLOW_ACP_`` 前缀名已废弃，仅作兼容回退。"""
+    return os.environ.get(BACKEND_FACTORY_ENV) or os.environ.get(BACKEND_FACTORY_ENV_LEGACY)
+
+
 def _load_backend(config: BridgeConfig) -> Any:
-    spec = os.environ.get(BACKEND_FACTORY_ENV)
+    spec = _backend_factory_spec()
     if not spec:
         from .backend import EmbeddedDeerFlowBackend
 

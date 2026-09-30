@@ -522,7 +522,7 @@ class DeerFlowAgent:
 
         ACP 的 ``usage_update`` 表达的是「上下文窗口占用」，而 DeerFlow 给的是
         本轮 token 增量，两者语义不同。因此只有在用户显式配置了窗口大小
-        （``DEERFLOW_ACP_CONTEXT_WINDOW_TOKENS``）时才近似上报，默认关闭。
+        （``DEER_FLOW_ACP_CONTEXT_WINDOW_TOKENS``）时才近似上报，默认关闭。
         """
         size = self._config.context_window_tokens
         if not size:

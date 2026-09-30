@@ -461,7 +461,7 @@ async def test_new_session_response_carries_model_list():
 
 
 async def test_new_session_current_model_reflects_configured_default():
-    """启动期配置了默认模型（DEERFLOW_ACP_MODEL）时，current_model_id 跟随它。"""
+    """启动期配置了默认模型（DEER_FLOW_ACP_MODEL）时，current_model_id 跟随它。"""
     agent, _ = make_agent(FakeBackend(models=FAKE_MODELS), model_name="advanced")
     resp = await agent.new_session("/tmp")
     assert resp.models is not None
