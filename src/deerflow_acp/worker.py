@@ -87,6 +87,9 @@ def run(job: dict[str, Any], out: IO[bytes]) -> int:
     config = BridgeConfig(**job.get("config", {}))
     message = job["message"]
     thread_id = job["thread_id"]
+    # 会话级模型覆盖：None 表示沿用进程级默认，不向下透传显式值。
+    raw_model = job.get("model_name")
+    model_name = raw_model if isinstance(raw_model, str) and raw_model else None
 
     try:
         backend = _load_backend(config)
@@ -100,7 +103,7 @@ def run(job: dict[str, Any], out: IO[bytes]) -> int:
 
     generator: Iterator[tuple[str, dict[str, Any]]] | None = None
     try:
-        generator = backend.stream(message, thread_id=thread_id)
+        generator = backend.stream(message, thread_id=thread_id, model_name=model_name)
         for event_type, data in generator:
             if _stopping:
                 break

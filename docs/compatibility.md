@@ -32,7 +32,7 @@ DeerFlow harness **不在** `dependencies` 中。它不在任何公开索引上�
 | 方法 | 状态 | 行为 |
 | --- | --- | --- |
 | `initialize` | 支持 | 不构造 `DeerFlowClient`，不触发任何模型或凭据加载 |
-| `session/new` | 支持 | 生成 `df-<uuid4hex>` 作为 sessionId，同时即为 DeerFlow `thread_id` |
+| `session/new` | 支持 | 生成 `df-<uuid4hex>` 作为 sessionId，同时即为 DeerFlow `thread_id`；响应携带 `models` 挂点（UNSTABLE）：`availableModels` 取 DeerFlow `list_models()`，`currentModelId` 取启动期默认。清单获取失败时会话照常创建，仅模型面缺省 |
 | `session/load` | 支持 | 恢复会话并**重放**历史消息 |
 | `session/resume` | 支持（unstable） | 恢复会话，**不重放**——Multica 客户端已持有本地记录，重放会造成 UI 重复 |
 | `session/prompt` | 支持 | 仅接受 `text` 内容块 |
@@ -40,7 +40,7 @@ DeerFlow harness **不在** `dependencies` 中。它不在任何公开索引上�
 | `session/close` | 支持（unstable） | 释放注册表条目，DeerFlow checkpoint 保留。**turn 在跑时延后生效**：只置取消标志，等在途 turn 确认 worker 进程组终结后才摘除条目（见「同 session 生命周期」） |
 | `authenticate` | **不支持** | `-32601`。凭据由 DeerFlow 本地机制注入，桥不参与认证 |
 | `session/set_mode` | **不支持** | `-32601` |
-| `session/set_model` | **不支持** | `-32601`。模型经 `DEERFLOW_ACP_MODEL` 在启动时固定 |
+| `session/set_model` | 支持（unstable） | 会话级模型覆盖，**下一轮 turn 生效**。覆盖存父进程注册表（每 turn 新建 worker，状态不能留 worker），由 worker payload 逐轮携带，落到 `DeerFlowClient.stream(..., model_name=...)` 逐轮覆盖能力；无效/未授权模型（不在 `list_models()` 清单内）返回 `-32602` 并附可用清单，不静默。同进程 `resume` 保持覆盖；跨进程恢复回到默认模型（桥不持久化会话级模型状态）。`DEERFLOW_ACP_MODEL` 仍是进程级默认，未 `set_model` 的会话行为与既往一致 |
 | `session/set_config_option` | **不支持** | `-32601` |
 | `session/fork` | **不支持** | `-32601`。DeerFlow checkpointer 无 fork 语义 |
 | `session/list` | **不支持** | `-32601`。桥不持久化会话清单 |
@@ -175,7 +175,11 @@ checkpoint。桥用一条不变式守住这点：
    system 消息跳过——ACP 没有无损表达历史工具调用的形态，跳过好过伪造。
 2. **同一 session 不支持并发 turn**。第二个 `session/prompt` 返回 `-32011`；
    `session/close` 落在 turn 运行中时延后生效，见「同 session 生命周期」。
-3. **模型在进程生命周期内固定**。`session/set_model` 不支持，换模型需重启桥。
+3. **会话级模型覆盖不跨进程持久**。`session/set_model` 的覆盖保存在桥进程内存；
+   同进程内 `session/resume` 保持覆盖，父进程重启后恢复的会话回到默认模型
+   （`DEERFLOW_ACP_MODEL` 或 DeerFlow 配置默认）。模型清单经 `new_session` 响应的
+   `models` 字段（UNSTABLE）下发，数据取 DeerFlow `list_models()`；清单获取失败时
+   会话创建不受阻，仅模型面缺省。
 4. **`session/fork` 不支持**。DeerFlow checkpointer 无对应语义。
 5. **凭据完全交给 DeerFlow**。桥不读、不存、不转发任何 API key。
 6. **脱敏是启发式的**。基于形态匹配，不可能覆盖全部秘密形态；它是最后一道

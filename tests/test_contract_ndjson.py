@@ -958,3 +958,100 @@ def test_unconfirmed_group_quarantines_session_over_the_wire(peer):
 
     p.proc.kill()
     p.proc.wait(timeout=5)
+
+
+# ----------------------------------------------------------------------
+# 模型选择：session/set_model 与 new_session 模型面（UNSTABLE）
+# ----------------------------------------------------------------------
+
+CONTRACT_MODELS = [
+    {"name": "basic", "model": "deepseek-chat", "display_name": "Basic", "description": "默认基础模型"},
+    {"name": "advanced", "model": "deepseek-reasoner", "display_name": "Advanced", "description": "高级推理模型"},
+]
+
+
+def test_new_session_response_carries_models_over_the_wire(peer):
+    p = peer({"events": TEXT_EVENTS, "models": CONTRACT_MODELS})
+    p.initialize()
+    session_id = p.new_session()
+    # new_session 的响应在 helper 里只取了 sessionId，这里直接发原始请求拿全量结果
+    rid = p.send("session/new", {"cwd": "/tmp", "mcpServers": []})
+    resp = p.await_response(rid)
+    models = resp["result"]["models"]
+    assert models is not None, "响应缺少 models 挂点"
+    assert [(m["modelId"], m["name"]) for m in models["availableModels"]] == [
+        ("basic", "Basic"),
+        ("advanced", "Advanced"),
+    ]
+    assert models["currentModelId"] == "basic"
+    p.close()
+
+
+def test_set_model_unknown_session_returns_unknown_session_error(peer):
+    p = peer({"events": TEXT_EVENTS, "models": CONTRACT_MODELS})
+    p.initialize()
+    rid = p.send("session/set_model", {"sessionId": "df-nope", "modelId": "basic"})
+    assert p.await_response(rid)["error"]["code"] == -32001
+    p.close()
+
+
+def test_set_model_invalid_model_returns_invalid_params_not_silent(peer):
+    p = peer({"events": TEXT_EVENTS, "models": CONTRACT_MODELS})
+    p.initialize()
+    session_id = p.new_session()
+    rid = p.send("session/set_model", {"sessionId": session_id, "modelId": "no-such-model"})
+    resp = p.await_response(rid)
+    assert resp["error"]["code"] == -32602
+    # 报错携带可用清单，客户端能据此纠正
+    assert "advanced" in resp["error"]["data"]["availableModels"]
+    p.close()
+
+
+def test_set_model_then_turn_completes_over_worker_path(peer):
+    """set_model 后的下一轮 turn 走真实 worker 子进程路径正常收敛。"""
+    p = peer(
+        {"events": TEXT_EVENTS, "models": CONTRACT_MODELS},
+        env_extra={
+            "DEERFLOW_ACP_FAKE_USE_WORKER": "1",
+            "DEERFLOW_ACP_WORKER_BACKEND": "fake_backend_server:build_backend",
+        },
+    )
+    p.initialize()
+    session_id = p.new_session()
+
+    rid = p.send("session/set_model", {"sessionId": session_id, "modelId": "advanced"})
+    assert "error" not in p.await_response(rid)
+
+    rid = p.send("session/prompt", {"sessionId": session_id, "prompt": [{"type": "text", "text": "你好"}]})
+    resp = p.await_response(rid, timeout=30)
+    assert "error" not in resp, f"set_model 之后的 turn 失败：{resp.get('error')}"
+    assert resp["result"]["stopReason"] == "end_turn"
+    p.close()
+
+
+def test_set_model_with_empty_model_list_rejects_all(peer):
+    """清单为空（无模型配置）时任何模型都无效：显式 -32602，不静默接受。"""
+    p = peer({"events": TEXT_EVENTS})
+    p.initialize()
+    session_id = p.new_session()
+    rid = p.send("session/set_model", {"sessionId": session_id, "modelId": "basic"})
+    resp = p.await_response(rid)
+    assert resp["error"]["code"] == -32602
+    assert resp["error"]["data"]["availableModels"] == []
+    p.close()
+
+
+def test_set_model_with_model_list_failure_is_backend_unavailable(peer):
+    """list_models 抛后端不可用时，set_model 拒绝设置而非盲设。"""
+    p = peer({"events": TEXT_EVENTS, "models_unavailable": "清单故障注入"})
+    p.initialize()
+    session_id = p.new_session()
+    # new_session 的模型面在清单故障下降级为缺失，会话创建不受阻
+    rid = p.send("session/new", {"cwd": "/tmp", "mcpServers": []})
+    new_resp = p.await_response(rid)
+    assert new_resp["result"]["sessionId"]
+    assert "models" not in new_resp["result"] or new_resp["result"]["models"] is None
+
+    rid = p.send("session/set_model", {"sessionId": session_id, "modelId": "basic"})
+    assert p.await_response(rid)["error"]["code"] == -32010
+    p.close()

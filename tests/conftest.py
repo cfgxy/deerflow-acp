@@ -26,11 +26,16 @@ class FakeBackend:
         threads: dict[str, list[dict[str, Any]]] | None = None,
         raise_on_stream: BaseException | None = None,
         thread_lookup_error: BaseException | None = None,
+        models: list[dict[str, Any]] | None = None,
+        model_lookup_error: BaseException | None = None,
     ) -> None:
         self.events = events or []
         self.threads = threads or {}
         self.raise_on_stream = raise_on_stream
         self.thread_lookup_error = thread_lookup_error
+        #: list_models() 返回的模型清单（DeerFlow ``ModelsListResponse`` 形态）
+        self.models = models
+        self.model_lookup_error = model_lookup_error
         #: 每次 yield 前等待此事件（用于制造「turn 正在运行」的窗口）
         self.gate: threading.Event | None = None
         #: 生成器被 close() 时置位，用于断言协作式取消真的生效
@@ -38,9 +43,12 @@ class FakeBackend:
         #: 实际产出的事件数，用于断言取消提前中断了流
         self.emitted = 0
         self.stream_calls: list[tuple[str, str]] = []
+        #: 每轮 turn 请求的模型覆盖（None = 未覆盖，沿用后端默认）
+        self.model_calls: list[str | None] = []
 
-    def stream(self, message: str, *, thread_id: str) -> Iterator[tuple[str, dict[str, Any]]]:
+    def stream(self, message: str, *, thread_id: str, model_name: str | None = None) -> Iterator[tuple[str, dict[str, Any]]]:
         self.stream_calls.append((message, thread_id))
+        self.model_calls.append(model_name)
         if self.raise_on_stream is not None:
             raise self.raise_on_stream
 
@@ -66,6 +74,11 @@ class FakeBackend:
         if self.thread_lookup_error is not None:
             raise self.thread_lookup_error
         return list(self.threads.get(thread_id, []))
+
+    def list_models(self) -> dict[str, Any]:
+        if self.model_lookup_error is not None:
+            raise self.model_lookup_error
+        return {"models": list(self.models or [])}
 
 
 class RecordingConnection:

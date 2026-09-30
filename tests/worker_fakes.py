@@ -108,7 +108,7 @@ class StatefulFakeBackend:
         (self._dir / "tool_child.pid").write_text(str(proc.pid), encoding="utf-8")
         return proc.pid
 
-    def stream(self, message: str, *, thread_id: str) -> Iterator[tuple[str, dict[str, Any]]]:
+    def stream(self, message: str, *, thread_id: str, model_name: str | None = None) -> Iterator[tuple[str, dict[str, Any]]]:
         if self._raise:
             raise RuntimeError(self._raise)
 

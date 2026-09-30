@@ -3,8 +3,10 @@
 DeerFlow 与 ACP（Agent Client Protocol）客户端之间的**独立桥接器**。
 
 桥只负责协议层的事：ACP 方法实现、事件归一化、会话恢复、取消与进程生命周期。
-它**不复制 DeerFlow 的研究编排能力**——所有编排、工具调用、模型选择、
-记忆与检索仍然发生在 DeerFlow 内部，桥通过嵌入式 `DeerFlowClient` 消费其事件流。
+它**不复制 DeerFlow 的研究编排能力**——所有编排、工具调用、记忆与检索仍然
+发生在 DeerFlow 内部，桥通过嵌入式 `DeerFlowClient` 消费其事件流。模型选择由
+客户端经 `session/set_model` 逐会话指定，实际执行仍落在 DeerFlow 既有能力上
+（逐轮覆盖、换模型自动重建 agent、role-scoped 模型授权）。
 
 ## 架构
 
@@ -93,10 +95,11 @@ API key 一律走 DeerFlow 自己的 gitignored `.env`，桥不接触。
 见 [`docs/compatibility.md`](docs/compatibility.md)。要点：
 
 - **支持**：`initialize`、`session/new`、`session/load`、`session/resume`、
-  `session/prompt`、`session/cancel`、`session/close`、流式
+  `session/prompt`、`session/cancel`、`session/close`、`session/set_model`（unstable，
+  响应与列表语义见兼容矩阵）、流式
   `agent_message_chunk` / `agent_thought_chunk` / `tool_call` / `tool_call_update`。
 - **显式降级**（返回 `-32601`，不伪造）：`authenticate`、`session/set_mode`、
-  `session/set_model`、`session/set_config_option`、`session/fork`、`session/list`。
+  `session/set_config_option`、`session/fork`、`session/list`。
 - **不上报**：`plan`（DeerFlow 无稳定的结构化计划事件源）、
   `session/request_permission`（DeerFlow 侧无权限询问回路）。
 - **usage 降级**：ACP `usage_update` 的 `size`/`used` 表达上下文窗口占用，

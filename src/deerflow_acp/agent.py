@@ -19,10 +19,13 @@ from acp.schema import (
     InitializeResponse,
     LoadSessionResponse,
     McpCapabilities,
+    ModelInfo,
     NewSessionResponse,
     PromptCapabilities,
     PromptResponse,
     ResumeSessionResponse,
+    SessionModelState,
+    SetSessionModelResponse,
     Usage,
     UsageUpdate,
 )
@@ -101,6 +104,16 @@ def _error_type_name(exc: BaseException) -> str:
     if isinstance(exc, RemoteBackendError):
         return exc.error_class
     return type(exc).__name__
+
+
+def _available_model_ids(models: dict[str, Any] | None) -> set[str]:
+    """从 ``list_models()`` 负载提取合法模型 ID 集合。"""
+    if not isinstance(models, dict):
+        return set()
+    entries = models.get("models")
+    if not isinstance(entries, list):
+        return set()
+    return {entry["name"] for entry in entries if isinstance(entry, dict) and isinstance(entry.get("name"), str)}
 
 
 def _quarantine_error(session_id: str) -> RequestError:
@@ -189,7 +202,10 @@ class DeerFlowAgent:
     async def new_session(self, cwd: str, mcp_servers: list[Any] | None = None, **kwargs: Any) -> NewSessionResponse:
         self._reject_mcp_servers(mcp_servers)
         session = self._sessions.create(cwd)
-        return NewSessionResponse(session_id=session.session_id)
+        # 模型清单是 UNSTABLE 扩展面：获取失败不阻断会话创建（turn 时后端
+        # 不可用会如实报错），只是客户端暂时拿不到下拉数据。
+        models = self._build_session_models()
+        return NewSessionResponse(session_id=session.session_id, models=models)
 
     async def load_session(
         self,
@@ -247,7 +263,12 @@ class DeerFlowAgent:
                 await self._conn.session_update(session_id=session_id, update=update)
 
         try:
-            outcome = await self._sessions.run_turn(session, message, on_event)
+            outcome = await self._sessions.run_turn(
+                session,
+                message,
+                on_event,
+                model_name=session.model_override,
+            )
         except SessionQuarantinedError:
             # 两处都要拦：进入前（上一轮留下的隔离）与本轮收尾时新置的隔离。
             raise _quarantine_error(session_id) from None
@@ -317,8 +338,53 @@ class DeerFlowAgent:
     async def set_session_mode(self, mode_id: str, session_id: str, **kwargs: Any) -> None:
         raise RequestError.method_not_found("session/set_mode")
 
-    async def set_session_model(self, model_id: str, session_id: str, **kwargs: Any) -> None:
-        raise RequestError.method_not_found("session/set_model")
+    async def set_session_model(self, model_id: str, session_id: str, **kwargs: Any) -> SetSessionModelResponse | None:
+        """``session/set_model``：为会话设置逐轮模型覆盖。
+
+        语义（显式选定，均有测试覆盖）：
+
+        * 覆盖存在父进程 ``SessionRegistry`` 的会话对象上——每轮 turn 的
+          worker 都是新进程，状态不能留 worker；从下一轮 turn 开始生效，
+          在途 turn 不受影响。
+        * 无效模型（不在 DeerFlow 模型清单内）显式报错，不静默接受；
+          未授权模型的运行期策略仍由 DeerFlow 内建的 role-scoped 授权
+          （``_authorize_model_name``）兜底，桥不复制这层策略。
+        * 同进程 resume 复用会话对象，覆盖保持；跨进程恢复（父进程重启
+          后 resume）无覆盖记录，回到默认模型——桥不持久化会话级模型状态。
+        """
+        try:
+            session = self._sessions.get(session_id)
+        except SessionQuarantinedError:
+            raise _quarantine_error(session_id) from None
+        except UnknownSessionError:
+            raise RequestError(
+                ERROR_UNKNOWN_SESSION,
+                "未知会话",
+                {"sessionId": session_id, "hint": "先调用 session/new，或用 session/load 恢复已有会话"},
+            ) from None
+
+        models = self._fetch_models()
+        if models is None:
+            # 拿不到清单就不能校验模型——盲设违反「无效模型显式报错」的约定，
+            # 因此拒绝而非静默接受。可用性属于后端问题，走专用错误码。
+            raise RequestError(
+                ERROR_BACKEND_UNAVAILABLE,
+                "DeerFlow 模型清单不可用，无法校验模型",
+                {"sessionId": session_id},
+            ) from None
+        available = _available_model_ids(models)
+        if not isinstance(model_id, str) or model_id not in available:
+            raise RequestError.invalid_params(
+                {
+                    "reason": "未知或未授权的模型",
+                    "modelId": model_id,
+                    "availableModels": sorted(available),
+                }
+            )
+
+        session.model_override = model_id
+        logger.info("会话 %s 的模型已设置为 %s（下一轮 turn 生效）", session_id, model_id)
+        return SetSessionModelResponse()
 
     async def set_config_option(self, config_option_id: str, session_id: str, value: Any, **kwargs: Any) -> None:
         raise RequestError.method_not_found("session/set_config_option")
@@ -338,6 +404,46 @@ class DeerFlowAgent:
     # ------------------------------------------------------------------
     # 内部
     # ------------------------------------------------------------------
+
+    def _fetch_models(self) -> dict[str, Any] | None:
+        """取后端模型清单；后端未提供该能力或清单不可用时返回 None。
+
+        调用方按用途分账：``new_session`` 把 None 表达为「不带模型面」；
+        ``set_session_model`` 把 None 升级为显式报错（不能盲设模型）。
+        """
+        list_models_fn = getattr(self._backend, "list_models", None)
+        if not callable(list_models_fn):
+            return None
+        try:
+            return list_models_fn()
+        except Exception as exc:  # noqa: BLE001 —— 后端可抛任意异常，含脱敏包装类型
+            logger.warning("读取 DeerFlow 模型清单失败：%s", redact_text(exc))
+            return None
+
+    def _build_session_models(self) -> SessionModelState | None:
+        """构造 ``new_session`` 响应的模型面；无清单数据时返回 None。"""
+        models = self._fetch_models()
+        if models is None:
+            return None
+        entries = models.get("models") if isinstance(models, dict) else None
+        if not isinstance(entries, list):
+            return None
+        available = [
+            ModelInfo(
+                model_id=str(entry["name"]),
+                name=str(entry.get("display_name") or entry["name"]),
+                description=(str(entry["description"]) if entry.get("description") is not None else None),
+            )
+            for entry in entries
+            if isinstance(entry, dict) and isinstance(entry.get("name"), str) and entry["name"]
+        ]
+        if not available:
+            return None
+        available_ids = [m.model_id for m in available]
+        # 当前模型：会话覆盖尚未产生（新建会话），依次取启动期配置覆盖、
+        # DeerFlow 默认语义（清单第一项，与 client ``models[0].name`` 同源）。
+        current = self._config.model_name if self._config.model_name in available_ids else available_ids[0]
+        return SessionModelState(available_models=available, current_model_id=current)
 
     def _reject_mcp_servers(self, mcp_servers: list[Any] | None) -> None:
         if mcp_servers:
