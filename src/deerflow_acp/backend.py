@@ -12,6 +12,7 @@
 
 from __future__ import annotations
 
+import os
 from collections.abc import Iterator
 from typing import Any, Protocol, runtime_checkable
 
@@ -20,6 +21,24 @@ from .logging_setup import get_logger
 from .sanitize import describe_exception
 
 logger = get_logger("backend")
+
+#: 经 DeerFlow ``direct_env_secrets`` 信任通道逐 turn 注入的任务凭据名单。
+#: MULTICA_TOKEN 由 multica 运行环境注入桥进程，worker 子进程继承同一环境；
+#: DeerFlow 侧把它作为 request-scoped secret 送进 bash 工具的沙箱子进程 env
+#: （注入优先于剥离）。名单之外的任何环境变量既不收集也不注入，DeerFlow 的
+#: env_policy 剥离语义不受影响。凭据只随请求在进程内传递，不进事件、日志或
+#: job payload。
+_DIRECT_ENV_SECRET_NAMES = ("MULTICA_TOKEN",)
+
+
+def _collect_direct_env_secrets() -> dict[str, str]:
+    """从当前进程环境收集本 turn 要注入的任务凭据。
+
+    「存在且非空才收集」：缺失（本地裸跑、非 multica 宿主）时返回空映射，
+    调用方即不携带该通道；每 turn 调用一次，不做进程级缓存，token 生命
+    周期跟随请求。
+    """
+    return {name: value for name in _DIRECT_ENV_SECRET_NAMES if (value := os.environ.get(name))}
 
 
 class BackendUnavailableError(RuntimeError):
@@ -106,6 +125,9 @@ class EmbeddedDeerFlowBackend:
         # DeerFlow 的 stream(**kwargs) 支持逐轮 model_name 覆盖；None 时不传，
         # 让 client 沿用它自己的默认（含构造期 DEERFLOW_ACP_MODEL 覆盖）。
         kwargs: dict[str, Any] = {"model_name": model_name} if model_name else {}
+        direct_env_secrets = _collect_direct_env_secrets()
+        if direct_env_secrets:
+            kwargs["direct_env_secrets"] = direct_env_secrets
         for event in client.stream(message, thread_id=thread_id, **kwargs):
             yield event.type, dict(event.data or {})
 
