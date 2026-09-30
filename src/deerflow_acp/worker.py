@@ -97,6 +97,10 @@ def run(job: dict[str, Any], out: IO[bytes]) -> int:
     # 会话级模型覆盖：None 表示沿用进程级默认，不向下透传显式值。
     raw_model = job.get("model_name")
     model_name = raw_model if isinstance(raw_model, str) and raw_model else None
+    # 会话级思考开关覆盖：严格 bool 校验（JSON 的 1/0 不是开关，归 None
+    # 回退静态默认），False 是合法值，不能用真值判断。
+    raw_thinking = job.get("thinking_enabled")
+    thinking_enabled = raw_thinking if isinstance(raw_thinking, bool) else None
 
     try:
         backend = _load_backend(config)
@@ -110,7 +114,12 @@ def run(job: dict[str, Any], out: IO[bytes]) -> int:
 
     generator: Iterator[tuple[str, dict[str, Any]]] | None = None
     try:
-        generator = backend.stream(message, thread_id=thread_id, model_name=model_name)
+        generator = backend.stream(
+            message,
+            thread_id=thread_id,
+            model_name=model_name,
+            thinking_enabled=thinking_enabled,
+        )
         for event_type, data in generator:
             if _stopping:
                 break

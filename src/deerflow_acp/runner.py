@@ -105,6 +105,7 @@ class TurnRunner(Protocol):
         cancel_event: threading.Event,
         grace: float,
         model_name: str | None = None,
+        thinking_enabled: bool | None = None,
     ) -> RunResult: ...
 
 
@@ -146,11 +147,18 @@ class SubprocessTurnRunner:
         self._live_pgids.clear()
         return pgids
 
-    def _job_payload(self, session_id: str, message: str, model_name: str | None = None) -> bytes:
+    def _job_payload(
+        self,
+        session_id: str,
+        message: str,
+        model_name: str | None = None,
+        thinking_enabled: bool | None = None,
+    ) -> bytes:
         # 只传后端构造所需的配置，且这些字段本身不含凭据——DeerFlow 的 key
         # 仍由它自己的本地注入机制（.env + config.yaml 占位符）从环境读取，
-        # 桥既不读也不转发它们。model_name 是会话级覆盖（可为 None），
-        # 同样不含凭据：它只是 DeerFlow 模型配置清单里的一个名字。
+        # 桥既不读也不转发它们。model_name / thinking_enabled 是会话级覆盖
+        # （均可为 None），同样不含凭据：前者只是 DeerFlow 模型配置清单里的
+        # 一个名字，后者只是布尔开关。
         config_fields = {
             f.name: getattr(self._config, f.name)
             for f in dataclasses.fields(self._config)
@@ -162,10 +170,17 @@ class SubprocessTurnRunner:
             "thread_id": session_id,
             "config": config_fields,
             "model_name": model_name,
+            "thinking_enabled": thinking_enabled,
         }
         return (json.dumps(payload, ensure_ascii=False) + "\n").encode("utf-8")
 
-    async def _spawn(self, session_id: str, message: str, model_name: str | None = None) -> asyncio.subprocess.Process:
+    async def _spawn(
+        self,
+        session_id: str,
+        message: str,
+        model_name: str | None = None,
+        thinking_enabled: bool | None = None,
+    ) -> asyncio.subprocess.Process:
         proc = await asyncio.create_subprocess_exec(
             sys.executable,
             "-m",
@@ -179,7 +194,7 @@ class SubprocessTurnRunner:
             env=self._worker_env(),
         )
         assert proc.stdin is not None
-        proc.stdin.write(self._job_payload(session_id, message, model_name))
+        proc.stdin.write(self._job_payload(session_id, message, model_name, thinking_enabled))
         with contextlib.suppress(Exception):
             await proc.stdin.drain()
         proc.stdin.close()
@@ -202,9 +217,10 @@ class SubprocessTurnRunner:
         cancel_event: threading.Event,
         grace: float,
         model_name: str | None = None,
+        thinking_enabled: bool | None = None,
     ) -> RunResult:
         try:
-            proc = await self._spawn(session_id, message, model_name)
+            proc = await self._spawn(session_id, message, model_name, thinking_enabled)
         except Exception as exc:  # noqa: BLE001
             raise WorkerStartError(describe_exception(exc)) from exc
 
@@ -469,6 +485,7 @@ class InProcessTurnRunner:
         cancel_event: threading.Event,
         grace: float,
         model_name: str | None = None,
+        thinking_enabled: bool | None = None,
     ) -> RunResult:
         loop = asyncio.get_running_loop()
         queue: asyncio.Queue[Any] = asyncio.Queue(maxsize=256)
@@ -496,7 +513,12 @@ class InProcessTurnRunner:
             error: BaseException | None = None
             cancelled = False
             try:
-                generator = backend.stream(message, thread_id=session_id, model_name=model_name)
+                generator = backend.stream(
+                    message,
+                    thread_id=session_id,
+                    model_name=model_name,
+                    thinking_enabled=thinking_enabled,
+                )
                 for event in generator:
                     if cancel_event.is_set():
                         cancelled = True

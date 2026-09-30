@@ -45,10 +45,20 @@ class FakeBackend:
         self.stream_calls: list[tuple[str, str]] = []
         #: 每轮 turn 请求的模型覆盖（None = 未覆盖，沿用后端默认）
         self.model_calls: list[str | None] = []
+        #: 每轮 turn 请求的思考开关覆盖（None = 未覆盖，沿用后端默认）
+        self.thinking_calls: list[bool | None] = []
 
-    def stream(self, message: str, *, thread_id: str, model_name: str | None = None) -> Iterator[tuple[str, dict[str, Any]]]:
+    def stream(
+        self,
+        message: str,
+        *,
+        thread_id: str,
+        model_name: str | None = None,
+        thinking_enabled: bool | None = None,
+    ) -> Iterator[tuple[str, dict[str, Any]]]:
         self.stream_calls.append((message, thread_id))
         self.model_calls.append(model_name)
+        self.thinking_calls.append(thinking_enabled)
         if self.raise_on_stream is not None:
             raise self.raise_on_stream
 

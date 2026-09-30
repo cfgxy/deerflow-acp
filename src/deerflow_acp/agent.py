@@ -24,7 +24,10 @@ from acp.schema import (
     PromptCapabilities,
     PromptResponse,
     ResumeSessionResponse,
+    SessionConfigOptionSelect,
+    SessionConfigSelectOption,
     SessionModelState,
+    SetSessionConfigOptionResponse,
     SetSessionModelResponse,
     Usage,
     UsageUpdate,
@@ -32,7 +35,13 @@ from acp.schema import (
 
 from . import __version__
 from .backend import BackendUnavailableError, DeerFlowBackend, EmbeddedDeerFlowBackend
-from .config import BridgeConfig
+from .config import (
+    THINKING_CONFIG_OPTION_ID,
+    THINKING_LABELS,
+    THINKING_VALUES,
+    BridgeConfig,
+    thinking_value,
+)
 from .events import EventNormalizer
 from .logging_setup import get_logger
 from .runner import RemoteBackendError, TurnRunner
@@ -205,7 +214,11 @@ class DeerFlowAgent:
         # 模型清单是 UNSTABLE 扩展面：获取失败不阻断会话创建（turn 时后端
         # 不可用会如实报错），只是客户端暂时拿不到下拉数据。
         models = self._build_session_models()
-        return NewSessionResponse(session_id=session.session_id, models=models)
+        return NewSessionResponse(
+            session_id=session.session_id,
+            models=models,
+            config_options=[self._build_thinking_option(session)],
+        )
 
     async def load_session(
         self,
@@ -230,8 +243,11 @@ class DeerFlowAgent:
         差别只在于 resume 不重放历史——Multica 客户端在续会话时已持有
         本地会话记录，重放会造成 UI 重复。
         """
-        self._resume_session(session_id, cwd, mcp_servers)
-        return ResumeSessionResponse()
+        session = self._resume_session(session_id, cwd, mcp_servers)
+        # resume 是多回合的常态路径：选项面必须同样可用，否则客户端在
+        # 后续回合拿不到可下发的选项 id 与词表（覆盖已随旧进程消失，
+        # 这里回带的 current 就是本回合真正生效的值）。
+        return ResumeSessionResponse(config_options=[self._build_thinking_option(session)])
 
     async def close_session(self, session_id: str, **kwargs: Any) -> None:
         self._sessions.close(session_id)
@@ -268,6 +284,7 @@ class DeerFlowAgent:
                 message,
                 on_event,
                 model_name=session.model_override,
+                thinking_enabled=session.thinking_override,
             )
         except SessionQuarantinedError:
             # 两处都要拦：进入前（上一轮留下的隔离）与本轮收尾时新置的隔离。
@@ -386,8 +403,59 @@ class DeerFlowAgent:
         logger.info("会话 %s 的模型已设置为 %s（下一轮 turn 生效）", session_id, model_id)
         return SetSessionModelResponse()
 
-    async def set_config_option(self, config_option_id: str, session_id: str, value: Any, **kwargs: Any) -> None:
-        raise RequestError.method_not_found("session/set_config_option")
+    async def set_config_option(self, config_option_id: str, session_id: str, value: Any, **kwargs: Any) -> Any:
+        """``session/set_config_option``：为会话设置思考开关。
+
+        语义（显式选定，均有测试覆盖）：
+
+        * 只认 ``id="thinking"``、值 ``on``/``off``：DeerFlow 现网引擎只有
+          思考开关，没有离散档位；其它 id 与取值显式拒绝，不静默接受
+          「广播词表之外的假档位」。
+        * 覆盖存在父进程 ``SessionRegistry`` 的会话对象上，从下一轮 turn
+          开始生效，在途 turn 不受影响；空值语义=未覆盖时沿用
+          ``DEERFLOW_ACP_THINKING`` 静态默认（ACP 层无空档位，客户端
+          不发请求即回到默认）。
+        * 响应回带刷新后的选项（currentValue=新值），客户端的读回确认
+          有据可依。
+        """
+        try:
+            session = self._sessions.get(session_id)
+        except SessionQuarantinedError:
+            raise _quarantine_error(session_id) from None
+        except UnknownSessionError:
+            raise RequestError(
+                ERROR_UNKNOWN_SESSION,
+                "未知会话",
+                {"sessionId": session_id, "hint": "先调用 session/new，或用 session/load 恢复已有会话"},
+            ) from None
+
+        if config_option_id != THINKING_CONFIG_OPTION_ID:
+            raise RequestError.invalid_params(
+                {
+                    "reason": "不支持的配置选项",
+                    "configId": config_option_id,
+                    "supportedIds": [THINKING_CONFIG_OPTION_ID],
+                }
+            )
+        if not isinstance(value, str) or value not in THINKING_VALUES:
+            raise RequestError.invalid_params(
+                {
+                    "reason": "思考开关只接受 on/off（DeerFlow 无离散档位）",
+                    "configId": THINKING_CONFIG_OPTION_ID,
+                    "value": value,
+                    "supportedValues": list(THINKING_VALUES),
+                }
+            )
+
+        session.thinking_override = value == "on"
+        logger.info(
+            "会话 %s 的思考开关已设置为 %s（下一轮 turn 生效）",
+            session_id,
+            value,
+        )
+        return SetSessionConfigOptionResponse(
+            config_options=[self._build_thinking_option(session)],
+        )
 
     async def fork_session(self, *args: Any, **kwargs: Any) -> Any:
         raise RequestError.method_not_found("session/fork")
@@ -444,6 +512,29 @@ class DeerFlowAgent:
         # DeerFlow 默认语义（清单第一项，与 client ``models[0].name`` 同源）。
         current = self._config.model_name if self._config.model_name in available_ids else available_ids[0]
         return SessionModelState(available_models=available, current_model_id=current)
+
+    def _build_thinking_option(self, session: Session) -> SessionConfigOptionSelect:
+        """构造思考开关的 ACP 选项面，current 反映该会话当前真正生效的值。
+
+        覆盖未设置时回带静态默认（DEERFLOW_ACP_THINKING），保证
+        current_value 永远落在可选项内——客户端把它渲染为当前档位，
+        不会出现「裸显 token」。
+        """
+        current_override = session.thinking_override
+        effective = self._config.thinking_enabled if current_override is None else current_override
+        current = thinking_value(effective)
+        return SessionConfigOptionSelect(
+            id=THINKING_CONFIG_OPTION_ID,
+            name="Thinking",
+            category="thought_level",
+            description="DeerFlow 思考开关（on/off）",
+            current_value=current,
+            options=[
+                SessionConfigSelectOption(name=THINKING_LABELS[token], value=token)
+                for token in THINKING_VALUES
+            ],
+            type="select",
+        )
 
     def _reject_mcp_servers(self, mcp_servers: list[Any] | None) -> None:
         if mcp_servers:

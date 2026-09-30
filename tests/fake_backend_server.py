@@ -53,7 +53,9 @@ class ScriptedBackend:
         # 故障注入：list_models 抛后端不可用，验证「清单不可得」的错误路径
         self._models_unavailable = script.get("models_unavailable")
 
-    def stream(self, message: str, *, thread_id: str, model_name: str | None = None) -> Iterator[tuple[str, dict[str, Any]]]:
+    def stream(self, message: str, *, thread_id: str, model_name: str | None = None,
+        thinking_enabled: bool | None = None,
+    ) -> Iterator[tuple[str, dict[str, Any]]]:
         if self._pollute_stdout:
             print("这行垃圾绝不能出现在 IPC 通道里")
             sys.stdout.write("再来一行\n")

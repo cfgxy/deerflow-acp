@@ -18,6 +18,21 @@ DEFAULT_CANCEL_GRACE_SECONDS = 5.0
 # stdin 断连后等待在途 turn 收尾的时限（秒），超时直接退出进程。
 DEFAULT_SHUTDOWN_GRACE_SECONDS = 5.0
 
+# 思考开关的 ACP 选项面。DeerFlow 现网形态只有思考 on/off（引擎走
+# extra_body.thinking.type enabled/disabled，无离散档位），因此桥广播的是
+# 开关而不是 effort 级别词表。id 取 `thinking`、category 取 `thought_level`：
+# 客户端按 category 识别思考选项、按 id 回发 set_config_option（与 Kimi 的
+# id 形态一致），on/off token 即 DeerFlow 侧真实生效的取值。
+THINKING_CONFIG_OPTION_ID = "thinking"
+THINKING_VALUES: tuple[str, ...] = ("on", "off")
+
+THINKING_LABELS = {"on": "On", "off": "Off"}
+
+
+def thinking_value(enabled: bool) -> str:
+    """把布尔开关映射成 ACP 选项 token。"""
+    return "on" if enabled else "off"
+
 
 def _env_get(name: str, legacy_name: str) -> str | None:
     """新名优先；旧 ``DEERFLOW_ACP_`` 前缀名已废弃，仅作兼容回退。"""

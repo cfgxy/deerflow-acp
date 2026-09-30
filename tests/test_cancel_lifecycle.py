@@ -35,7 +35,9 @@ class StallingBackend:
         self.calls = 0
         self.closed = threading.Event()
 
-    def stream(self, message: str, *, thread_id: str, model_name: str | None = None) -> Iterator[tuple[str, dict[str, Any]]]:
+    def stream(self, message: str, *, thread_id: str, model_name: str | None = None,
+        thinking_enabled: bool | None = None,
+    ) -> Iterator[tuple[str, dict[str, Any]]]:
         self.calls += 1
         call_index = self.calls
 

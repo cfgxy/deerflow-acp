@@ -373,7 +373,6 @@ async def test_usage_update_is_clamped_to_window():
     "call",
     [
         lambda a: a.set_session_mode("m", "s"),
-        lambda a: a.set_config_option("k", "s", "v"),
         lambda a: a.fork_session(),
         lambda a: a.list_sessions(),
         lambda a: a.ext_method("custom/thing", {}),
@@ -534,3 +533,152 @@ async def test_backend_without_model_capability_still_serves_sessions():
 async def test_ext_notification_is_ignored_silently():
     agent, _ = make_agent(FakeBackend())
     await agent.ext_notification("custom/thing", {})
+
+
+# ----------------------------------------------------------------------
+# 思考开关：session/set_config_option 与 configOptions 广播
+#
+# DeerFlow 现网形态只有思考 on/off（engine 走 extra_body.thinking.type，
+# 无离散档位），因此这里广播的是开关而不是 effort 级别词表；id=`thinking`、
+# category=`thought_level` 与客户端侧识别面（Kimi 同形态）对齐。
+# ----------------------------------------------------------------------
+
+THINKING_OPTION_ID = "thinking"
+
+
+def _thinking_option(resp):
+    """从 new/resume/set 响应里取思考选项；不存在时返回 None。"""
+    for opt in resp.config_options or []:
+        if getattr(opt, "id", None) == THINKING_OPTION_ID:
+            return opt
+    return None
+
+
+async def test_new_session_broadcasts_thinking_config_option():
+    agent, _ = make_agent(FakeBackend())
+    resp = await agent.new_session("/tmp")
+
+    opt = _thinking_option(resp)
+    assert opt is not None
+    assert opt.category == "thought_level"
+    assert opt.type == "select"
+    assert [(o.value, o.name) for o in opt.options] == [("on", "On"), ("off", "Off")]
+    # 未设置覆盖时 current 反映静态默认（DEERFLOW_ACP_THINKING，缺省 on）
+    assert opt.current_value == "on"
+
+
+async def test_new_session_thinking_current_reflects_env_default():
+    agent, _ = make_agent(FakeBackend(), thinking_enabled=False)
+    resp = await agent.new_session("/tmp")
+    assert _thinking_option(resp).current_value == "off"
+
+
+async def test_resume_session_broadcasts_thinking_config_option():
+    """resume 是多回合的常态路径：选项面必须同样可用，否则客户端无法下发改档。"""
+    backend = FakeBackend(threads={"df-known": [{"type": "ai", "content": "旧"}]})
+    agent, _ = make_agent(backend)
+    resp = await agent.resume_session("/tmp", "df-known")
+    opt = _thinking_option(resp)
+    assert opt is not None
+    assert [(o.value, o.name) for o in opt.options] == [("on", "On"), ("off", "Off")]
+
+
+async def test_set_config_option_applies_and_echoes_refreshed_option():
+    """合法档位写入会话覆盖，响应回带刷新后的选项（currentValue=新值）。"""
+    agent, _ = make_agent(FakeBackend())
+    session_id = (await agent.new_session("/tmp")).session_id
+
+    resp = await agent.set_config_option(THINKING_OPTION_ID, session_id, "off")
+    opt = _thinking_option(resp)
+    assert opt is not None
+    assert opt.current_value == "off"
+
+    # 同进程 resume 复用会话对象：current 反映已设覆盖
+    resume_resp = await agent.resume_session("/tmp", session_id)
+    assert _thinking_option(resume_resp).current_value == "off"
+
+
+async def test_set_config_option_on_and_off_both_accepted():
+    agent, _ = make_agent(FakeBackend())
+    session_id = (await agent.new_session("/tmp")).session_id
+    resp = await agent.set_config_option(THINKING_OPTION_ID, session_id, "on")
+    assert _thinking_option(resp).current_value == "on"
+    resp = await agent.set_config_option(THINKING_OPTION_ID, session_id, "off")
+    assert _thinking_option(resp).current_value == "off"
+
+
+async def test_thinking_override_is_per_session():
+    """思考覆盖只作用于设置它的会话，不泄漏到其他会话。"""
+    agent, _ = make_agent(FakeBackend())
+    first = (await agent.new_session("/tmp")).session_id
+    second = (await agent.new_session("/tmp")).session_id
+
+    await agent.set_config_option(THINKING_OPTION_ID, first, "off")
+
+    first_resume = await agent.resume_session("/tmp", first)
+    second_resume = await agent.resume_session("/tmp", second)
+    assert _thinking_option(first_resume).current_value == "off"
+    assert _thinking_option(second_resume).current_value == "on"
+
+
+async def test_set_config_option_rejects_unknown_option_id():
+    agent, _ = make_agent(FakeBackend())
+    session_id = (await agent.new_session("/tmp")).session_id
+    with pytest.raises(RequestError) as exc:
+        await agent.set_config_option("effort", session_id, "off")
+    assert exc.value.code == -32602
+
+
+async def test_set_config_option_rejects_invalid_value():
+    """非法值显式拒绝（DeerFlow 无离散档位），不允许静默接受假档位。"""
+    agent, _ = make_agent(FakeBackend())
+    session_id = (await agent.new_session("/tmp")).session_id
+    for bad in ("max", "medium", "", "ON"):
+        with pytest.raises(RequestError) as exc:
+            await agent.set_config_option(THINKING_OPTION_ID, session_id, bad)
+        assert exc.value.code == -32602
+
+
+async def test_set_config_option_rejects_non_string_value():
+    agent, _ = make_agent(FakeBackend())
+    session_id = (await agent.new_session("/tmp")).session_id
+    with pytest.raises(RequestError) as exc:
+        await agent.set_config_option(THINKING_OPTION_ID, session_id, True)
+    assert exc.value.code == -32602
+
+
+async def test_set_config_option_unknown_session_errors():
+    agent, _ = make_agent(FakeBackend())
+    with pytest.raises(RequestError) as exc:
+        await agent.set_config_option(THINKING_OPTION_ID, "df-missing", "off")
+    assert exc.value.code == ERROR_UNKNOWN_SESSION
+
+
+async def test_thinking_override_applies_to_next_turn():
+    """set 后的下一轮 turn 携带覆盖；set 之前的轮次不带。"""
+    backend = FakeBackend()
+    agent, _ = make_agent(backend)
+    session_id = (await agent.new_session("/tmp")).session_id
+
+    await agent.prompt([text_block("第一轮")], session_id)
+    assert backend.thinking_calls == [None]
+
+    await agent.set_config_option(THINKING_OPTION_ID, session_id, "off")
+    await agent.prompt([text_block("第二轮")], session_id)
+    assert backend.thinking_calls == [None, False]
+
+    await agent.set_config_option(THINKING_OPTION_ID, session_id, "on")
+    await agent.prompt([text_block("第三轮")], session_id)
+    assert backend.thinking_calls == [None, False, True]
+
+
+async def test_thinking_override_not_leaked_across_sessions():
+    backend = FakeBackend()
+    agent, _ = make_agent(backend)
+    first = (await agent.new_session("/tmp")).session_id
+    second = (await agent.new_session("/tmp")).session_id
+
+    await agent.set_config_option(THINKING_OPTION_ID, first, "off")
+    await agent.prompt([text_block("hi")], first)
+    await agent.prompt([text_block("hi")], second)
+    assert backend.thinking_calls == [False, None]
