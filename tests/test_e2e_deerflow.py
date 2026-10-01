@@ -3,7 +3,7 @@
 默认跳过——需要真实模型凭据与本机 DeerFlow 部署，不能进 CI 常规流水线。
 显式开启：
 
-    DEERFLOW_ACP_E2E=1 pytest tests/test_e2e_deerflow.py -q
+    DEER_FLOW_ACP_E2E=1 pytest tests/test_e2e_deerflow.py -q
 
 跑的是完整链路：真实 `deerflow-acp acp` 子进程 → 真实 `DeerFlowClient`
 → 真实模型调用 → 真实 LangGraph checkpointer。
@@ -21,16 +21,16 @@ import time
 import pytest
 
 pytestmark = pytest.mark.skipif(
-    os.environ.get("DEERFLOW_ACP_E2E") != "1",
-    reason="需要本机 DeerFlow 与真实模型凭据；设 DEERFLOW_ACP_E2E=1 开启",
+    os.environ.get("DEER_FLOW_ACP_E2E") != "1",
+    reason="需要本机 DeerFlow 与真实模型凭据；设 DEER_FLOW_ACP_E2E=1 开启",
 )
 
 # 真实模型调用比契约测试慢一个数量级
-TURN_TIMEOUT = float(os.environ.get("DEERFLOW_ACP_E2E_TIMEOUT", "300"))
+TURN_TIMEOUT = float(os.environ.get("DEER_FLOW_ACP_E2E_TIMEOUT", "300"))
 
 # DeerFlow 只按**当前工作目录**查找 config.yaml（构造函数的 config_path 参数
 # 在当前版本并不改变查找根），因此桥子进程必须在 DeerFlow 部署根下启动。
-DEERFLOW_ROOT = os.environ.get("DEERFLOW_ACP_E2E_CWD", "/home/guxy/srv/deerflow")
+DEER_FLOW_ROOT = os.environ.get("DEER_FLOW_ACP_E2E_CWD", "/home/guxy/srv/deerflow")
 
 
 class Bridge:
@@ -109,7 +109,7 @@ def bridge():
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
-            cwd=DEERFLOW_ROOT,
+            cwd=DEER_FLOW_ROOT,
             env={**os.environ, "PYTHONUNBUFFERED": "1", **(env_extra or {})},
         )
         b = Bridge(proc)
@@ -252,7 +252,7 @@ def test_e2e_cancel_kills_real_worker_process_group(bridge):
 
     宽限期压到 0.5s，确保走的是强制终止分支而非协作退出。
     """
-    b = bridge({"DEERFLOW_ACP_CANCEL_GRACE_SECONDS": "0.5"})
+    b = bridge({"DEER_FLOW_ACP_CANCEL_GRACE_SECONDS": "0.5"})
     b.initialize()
     session_id = b.new_session()
 
@@ -291,7 +291,7 @@ def test_e2e_resume_same_session_after_forced_kill(bridge):
 
     这是进程隔离方案的核心风险点：SIGKILL 可能撕裂 checkpointer 写入。
     """
-    b = bridge({"DEERFLOW_ACP_CANCEL_GRACE_SECONDS": "0.5"})
+    b = bridge({"DEER_FLOW_ACP_CANCEL_GRACE_SECONDS": "0.5"})
     b.initialize()
     session_id = b.new_session()
 
@@ -325,7 +325,7 @@ def test_e2e_resume_same_session_after_forced_kill(bridge):
 
 def test_e2e_no_orphan_worker_after_sigterm(bridge):
     """桥收到 SIGTERM 时，正在跑的真实 worker 进程组不得残留。"""
-    b = bridge({"DEERFLOW_ACP_CANCEL_GRACE_SECONDS": "0.5"})
+    b = bridge({"DEER_FLOW_ACP_CANCEL_GRACE_SECONDS": "0.5"})
     b.initialize()
     session_id = b.new_session()
     b.send(

@@ -36,7 +36,7 @@ def build_parser() -> argparse.ArgumentParser:
     acp_parser.add_argument(
         "--log-level",
         default=None,
-        help="日志级别（默认取 DEERFLOW_ACP_LOG_LEVEL，再默认 INFO）；日志始终写 stderr",
+        help="日志级别（默认取 DEER_FLOW_ACP_LOG_LEVEL，再默认 INFO）；日志始终写 stderr",
     )
     acp_parser.add_argument("--config-path", default=None, help="DeerFlow config.yaml 路径；默认由 DeerFlow 自行解析")
     acp_parser.add_argument("--model", default=None, help="覆盖 DeerFlow 默认模型名")

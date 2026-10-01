@@ -78,14 +78,15 @@ Multica 的 hermes backend 会无条件在 argv 末尾拼接 `acp`，所以在 M
 
 | 环境变量 | 默认 | 说明 |
 | --- | --- | --- |
-| `DEERFLOW_ACP_LOG_LEVEL` | `INFO` | 日志级别；日志**始终**写 stderr |
-| `DEERFLOW_ACP_CONFIG_PATH` | 空 | DeerFlow `config.yaml` 路径；空则由 DeerFlow 自行解析 |
-| `DEERFLOW_ACP_MODEL` | 空 | 覆盖 DeerFlow 默认模型名 |
-| `DEERFLOW_ACP_THINKING` | `true` | 是否请求模型输出推理内容（映射为 `agent_thought_chunk`） |
-| `DEERFLOW_ACP_CANCEL_GRACE_SECONDS` | `5` | 取消后等待 worker 协作退出的宽限期；超时即 `killpg(SIGKILL)` |
-| `DEERFLOW_ACP_SHUTDOWN_GRACE_SECONDS` | `5` | 收到 SIGTERM/SIGINT 后等待在途 turn 收尾的时限 |
-| `DEERFLOW_ACP_CONTEXT_WINDOW_TOKENS` | 空 | 上下文窗口大小；不设则**不下发** `usage_update` |
-| `DEERFLOW_ACP_EMIT_USAGE_UPDATE` | `false` | 仅在同时设置了窗口大小时生效，见下方「usage 降级」 |
+| `DEER_FLOW_ACP_LOG_LEVEL` | `INFO` | 日志级别；日志**始终**写 stderr |
+| `DEER_FLOW_CONFIG_PATH` | 空 | DeerFlow `config.yaml` 路径；空则由 DeerFlow 自行解析 |
+| `DEERFLOW_ACP_*`（旧前缀名，含 `DEERFLOW_ACP_CONFIG_PATH`） | — | 已废弃；仅在新名未设置时作为兼容回退 |
+| `DEER_FLOW_ACP_MODEL` | 空 | 覆盖 DeerFlow 默认模型名 |
+| `DEER_FLOW_ACP_THINKING` | `true` | 是否请求模型输出推理内容（映射为 `agent_thought_chunk`） |
+| `DEER_FLOW_ACP_CANCEL_GRACE_SECONDS` | `5` | 取消后等待 worker 协作退出的宽限期；超时即 `killpg(SIGKILL)` |
+| `DEER_FLOW_ACP_SHUTDOWN_GRACE_SECONDS` | `5` | 收到 SIGTERM/SIGINT 后等待在途 turn 收尾的时限 |
+| `DEER_FLOW_ACP_CONTEXT_WINDOW_TOKENS` | 空 | 上下文窗口大小；不设则**不下发** `usage_update` |
+| `DEER_FLOW_ACP_EMIT_USAGE_UPDATE` | `false` | 仅在同时设置了窗口大小时生效，见下方「usage 降级」 |
 
 模板见 `config.example.env`。**该文件只放非秘密的行为开关**；模型 / 搜索
 API key 一律走 DeerFlow 自己的 gitignored `.env`，桥不接触。
@@ -111,7 +112,7 @@ API key 一律走 DeerFlow 自己的 gitignored `.env`，桥不接触。
 桥不可用时的回退路径（按代价从低到高）：
 
 1. `deerflow-acp doctor` 判定是 DeerFlow 运行时问题还是协议层问题。
-2. 设 `DEERFLOW_ACP_LOG_LEVEL=DEBUG` 复跑，stderr 会打印被忽略的事件类型。
+2. 设 `DEER_FLOW_ACP_LOG_LEVEL=DEBUG` 复跑，stderr 会打印被忽略的事件类型。
 3. 绕开桥，直接用 DeerFlow 自身的 HTTP 网关（`http://127.0.0.1:2026`）验证
    后端是否正常——桥的故障与 DeerFlow 的故障由此分账。
 4. 桥是独立进程，卸载它不影响 DeerFlow 与 Multica 任何既有功能。
@@ -125,9 +126,9 @@ API key 一律走 DeerFlow 自己的 gitignored `.env`，桥不接触。
 
 ```bash
 .venv/bin/pytest -q                       # 单元 + 协议契约测试（含真 worker 子进程）
-DEERFLOW_ACP_E2E=1 .venv/bin/pytest -q tests/test_e2e_deerflow.py   # 需要本机 DeerFlow
+DEER_FLOW_ACP_E2E=1 .venv/bin/pytest -q tests/test_e2e_deerflow.py   # 需要本机 DeerFlow
 ```
 
 契约测试（`tests/test_contract_ndjson.py`）默认走进程内后端验证 JSON-RPC 报文形状；
-带 `worker_path` 前缀的用例设 `DEERFLOW_ACP_FAKE_USE_WORKER=1`，跑**生产路径**——
+带 `worker_path` 前缀的用例设 `DEER_FLOW_ACP_FAKE_USE_WORKER=1`，跑**生产路径**——
 真子进程、真进程组、真 `killpg`，并由 worker 自报 pid/pgid 供父进程断言回收。

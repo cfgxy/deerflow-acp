@@ -127,9 +127,9 @@ def peer(tmp_path):
         worker_pid_path = tmp_path / f"worker-{len(procs)}.pid"
 
         env = dict(os.environ)
-        env["DEERFLOW_ACP_FAKE_SCRIPT"] = str(script_path)
-        env["DEERFLOW_ACP_FAKE_CLOSED_MARKER"] = str(closed_marker)
-        env["DEERFLOW_ACP_FAKE_WORKER_PID"] = str(worker_pid_path)
+        env["DEER_FLOW_ACP_FAKE_SCRIPT"] = str(script_path)
+        env["DEER_FLOW_ACP_FAKE_CLOSED_MARKER"] = str(closed_marker)
+        env["DEER_FLOW_ACP_FAKE_WORKER_PID"] = str(worker_pid_path)
         # worker 子进程用 `-m deerflow_acp.worker` 启动，需要能 import 到
         # tests/ 下的 fake_backend_server 才能加载脚本后端。
         env["PYTHONPATH"] = os.pathsep.join([str(TESTS_DIR), env.get("PYTHONPATH", "")]).rstrip(os.pathsep)
@@ -417,7 +417,7 @@ def test_authenticate_is_method_not_found(peer):
 
 
 def test_stdout_carries_only_jsonrpc_even_when_backend_prints(peer):
-    p = peer({"events": TEXT_EVENTS}, env_extra={"DEERFLOW_ACP_FAKE_POLLUTE": "1"})
+    p = peer({"events": TEXT_EVENTS}, env_extra={"DEER_FLOW_ACP_FAKE_POLLUTE": "1"})
 
     p.initialize()
     session_id = p.new_session()
@@ -433,7 +433,7 @@ def test_stdout_carries_only_jsonrpc_even_when_backend_prints(peer):
 
 def test_every_stdout_line_is_valid_jsonrpc(peer):
     """把整段 stdout 收下来逐行解析，任何一行不是 JSON-RPC 即失败。"""
-    p = peer({"events": TEXT_EVENTS}, env_extra={"DEERFLOW_ACP_FAKE_POLLUTE": "1"})
+    p = peer({"events": TEXT_EVENTS}, env_extra={"DEER_FLOW_ACP_FAKE_POLLUTE": "1"})
     p.initialize()
     session_id = p.new_session()
     rid = p.send("session/prompt", {"sessionId": session_id, "prompt": [{"type": "text", "text": "hi"}]})
@@ -505,8 +505,8 @@ CONTRACT_FAKE_DSN = "postgres://dfuser:Sup3rS3cretPw@127.0.0.1:5432/deerflow"
 #: 让 ACP server 走**生产路径**：turn 在独立进程组的 worker 子进程里执行。
 #: 上面那些进程内路径的用例只能证明 JSON-RPC 报文形状，证明不了进程隔离。
 WORKER_PATH_ENV = {
-    "DEERFLOW_ACP_FAKE_USE_WORKER": "1",
-    "DEERFLOW_ACP_WORKER_BACKEND": "fake_backend_server:build_backend",
+    "DEER_FLOW_ACP_FAKE_USE_WORKER": "1",
+    "DEER_FLOW_ACP_WORKER_BACKEND": "fake_backend_server:build_backend",
 }
 
 
@@ -534,7 +534,7 @@ def test_cancel_returns_within_grace_when_backend_stalls_before_first_yield(peer
     """
     p = peer(
         {"events": TEXT_EVENTS, "stall_before_first_yield_s": 30},
-        env_extra={"DEERFLOW_ACP_CANCEL_GRACE_SECONDS": "0.5"},
+        env_extra={"DEER_FLOW_ACP_CANCEL_GRACE_SECONDS": "0.5"},
     )
     p.initialize()
     session_id = p.new_session()
@@ -558,7 +558,7 @@ def test_session_reusable_after_stalled_cancel(peer):
     """被弃用的旧 worker 不得让同一 session 的后续 prompt 一直吃 -32011。"""
     p = peer(
         {"events": TEXT_EVENTS, "stall_before_first_yield_s": 3},
-        env_extra={"DEERFLOW_ACP_CANCEL_GRACE_SECONDS": "0.5"},
+        env_extra={"DEER_FLOW_ACP_CANCEL_GRACE_SECONDS": "0.5"},
     )
     p.initialize()
     session_id = p.new_session()
@@ -617,7 +617,7 @@ def test_worker_path_escalated_cancel_kills_process_group(peer):
     """
     p = peer(
         {"events": TEXT_EVENTS, "stall_before_first_yield_s": 30},
-        env_extra={**WORKER_PATH_ENV, "DEERFLOW_ACP_CANCEL_GRACE_SECONDS": "0.5"},
+        env_extra={**WORKER_PATH_ENV, "DEER_FLOW_ACP_CANCEL_GRACE_SECONDS": "0.5"},
     )
     p.initialize()
     session_id = p.new_session()
@@ -647,7 +647,7 @@ def test_worker_path_no_late_updates_after_original_stall_would_end(peer):
     """
     p = peer(
         {"events": TEXT_EVENTS, "stall_before_first_yield_s": 4},
-        env_extra={**WORKER_PATH_ENV, "DEERFLOW_ACP_CANCEL_GRACE_SECONDS": "0.5"},
+        env_extra={**WORKER_PATH_ENV, "DEER_FLOW_ACP_CANCEL_GRACE_SECONDS": "0.5"},
     )
     p.initialize()
     session_id = p.new_session()
@@ -774,7 +774,7 @@ def test_worker_path_no_orphan_after_sigterm_mid_turn(peer):
     """
     p = peer(
         {"events": TEXT_EVENTS, "stall_before_first_yield_s": 30},
-        env_extra={**WORKER_PATH_ENV, "DEERFLOW_ACP_SHUTDOWN_GRACE_SECONDS": "0.5"},
+        env_extra={**WORKER_PATH_ENV, "DEER_FLOW_ACP_SHUTDOWN_GRACE_SECONDS": "0.5"},
     )
     p.initialize()
     session_id = p.new_session()
@@ -870,7 +870,7 @@ def test_close_during_turn_then_resume_cannot_start_concurrent_turn(peer):
     """
     p = peer(
         {"events": TEXT_EVENTS, "stall_before_first_yield_s": 30, "threads": {}},
-        env_extra={**WORKER_PATH_ENV, "DEERFLOW_ACP_CANCEL_GRACE_SECONDS": "0.5"},
+        env_extra={**WORKER_PATH_ENV, "DEER_FLOW_ACP_CANCEL_GRACE_SECONDS": "0.5"},
     )
     p.initialize()
     session_id = p.new_session()
@@ -914,8 +914,8 @@ def test_unconfirmed_group_quarantines_session_over_the_wire(peer):
         {"events": TEXT_EVENTS, "stall_before_first_yield_s": 30, "threads": {"reuse": []}},
         env_extra={
             **WORKER_PATH_ENV,
-            "DEERFLOW_ACP_CANCEL_GRACE_SECONDS": "0.5",
-            "DEERFLOW_ACP_FAKE_FORCE_UNREAPED": "1",
+            "DEER_FLOW_ACP_CANCEL_GRACE_SECONDS": "0.5",
+            "DEER_FLOW_ACP_FAKE_FORCE_UNREAPED": "1",
         },
     )
     p.initialize()
@@ -1012,8 +1012,8 @@ def test_set_model_then_turn_completes_over_worker_path(peer):
     p = peer(
         {"events": TEXT_EVENTS, "models": CONTRACT_MODELS},
         env_extra={
-            "DEERFLOW_ACP_FAKE_USE_WORKER": "1",
-            "DEERFLOW_ACP_WORKER_BACKEND": "fake_backend_server:build_backend",
+            "DEER_FLOW_ACP_FAKE_USE_WORKER": "1",
+            "DEER_FLOW_ACP_WORKER_BACKEND": "fake_backend_server:build_backend",
         },
     )
     p.initialize()

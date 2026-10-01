@@ -35,8 +35,8 @@ REPO_TESTS = Path(__file__).parent
 def _worker_env(state: Path) -> dict[str, str]:
     """让 worker 子进程能 import 到 ``worker_fakes``，并指向本用例的状态目录。"""
     return {
-        "DEERFLOW_ACP_WORKER_BACKEND": "worker_fakes:build",
-        "DEERFLOW_ACP_FAKE_STATE": str(state),
+        "DEER_FLOW_ACP_WORKER_BACKEND": "worker_fakes:build",
+        "DEER_FLOW_ACP_FAKE_STATE": str(state),
         "PYTHONPATH": os.pathsep.join([str(REPO_TESTS), os.environ.get("PYTHONPATH", "")]).rstrip(os.pathsep),
     }
 
