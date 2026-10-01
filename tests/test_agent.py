@@ -6,8 +6,10 @@ import threading
 
 import pytest
 from acp import PROTOCOL_VERSION
+from acp.agent.router import build_agent_router
 from acp.exceptions import RequestError
 from acp.helpers import text_block
+from acp.meta import AGENT_METHODS
 from acp.schema import ImageContentBlock
 
 from conftest import FakeBackend, RecordingConnection
@@ -588,7 +590,7 @@ async def test_set_config_option_applies_and_echoes_refreshed_option():
     agent, _ = make_agent(FakeBackend())
     session_id = (await agent.new_session("/tmp")).session_id
 
-    resp = await agent.set_config_option(THINKING_OPTION_ID, session_id, "off")
+    resp = await agent.set_config_option(config_id=THINKING_OPTION_ID, session_id=session_id, value="off")
     opt = _thinking_option(resp)
     assert opt is not None
     assert opt.current_value == "off"
@@ -601,9 +603,9 @@ async def test_set_config_option_applies_and_echoes_refreshed_option():
 async def test_set_config_option_on_and_off_both_accepted():
     agent, _ = make_agent(FakeBackend())
     session_id = (await agent.new_session("/tmp")).session_id
-    resp = await agent.set_config_option(THINKING_OPTION_ID, session_id, "on")
+    resp = await agent.set_config_option(config_id=THINKING_OPTION_ID, session_id=session_id, value="on")
     assert _thinking_option(resp).current_value == "on"
-    resp = await agent.set_config_option(THINKING_OPTION_ID, session_id, "off")
+    resp = await agent.set_config_option(config_id=THINKING_OPTION_ID, session_id=session_id, value="off")
     assert _thinking_option(resp).current_value == "off"
 
 
@@ -613,7 +615,7 @@ async def test_thinking_override_is_per_session():
     first = (await agent.new_session("/tmp")).session_id
     second = (await agent.new_session("/tmp")).session_id
 
-    await agent.set_config_option(THINKING_OPTION_ID, first, "off")
+    await agent.set_config_option(config_id=THINKING_OPTION_ID, session_id=first, value="off")
 
     first_resume = await agent.resume_session("/tmp", first)
     second_resume = await agent.resume_session("/tmp", second)
@@ -625,7 +627,7 @@ async def test_set_config_option_rejects_unknown_option_id():
     agent, _ = make_agent(FakeBackend())
     session_id = (await agent.new_session("/tmp")).session_id
     with pytest.raises(RequestError) as exc:
-        await agent.set_config_option("effort", session_id, "off")
+        await agent.set_config_option(config_id="effort", session_id=session_id, value="off")
     assert exc.value.code == -32602
 
 
@@ -635,7 +637,7 @@ async def test_set_config_option_rejects_invalid_value():
     session_id = (await agent.new_session("/tmp")).session_id
     for bad in ("max", "medium", "", "ON"):
         with pytest.raises(RequestError) as exc:
-            await agent.set_config_option(THINKING_OPTION_ID, session_id, bad)
+            await agent.set_config_option(config_id=THINKING_OPTION_ID, session_id=session_id, value=bad)
         assert exc.value.code == -32602
 
 
@@ -643,14 +645,14 @@ async def test_set_config_option_rejects_non_string_value():
     agent, _ = make_agent(FakeBackend())
     session_id = (await agent.new_session("/tmp")).session_id
     with pytest.raises(RequestError) as exc:
-        await agent.set_config_option(THINKING_OPTION_ID, session_id, True)
+        await agent.set_config_option(config_id=THINKING_OPTION_ID, session_id=session_id, value=True)
     assert exc.value.code == -32602
 
 
 async def test_set_config_option_unknown_session_errors():
     agent, _ = make_agent(FakeBackend())
     with pytest.raises(RequestError) as exc:
-        await agent.set_config_option(THINKING_OPTION_ID, "df-missing", "off")
+        await agent.set_config_option(config_id=THINKING_OPTION_ID, session_id="df-missing", value="off")
     assert exc.value.code == ERROR_UNKNOWN_SESSION
 
 
@@ -663,11 +665,11 @@ async def test_thinking_override_applies_to_next_turn():
     await agent.prompt([text_block("第一轮")], session_id)
     assert backend.thinking_calls == [None]
 
-    await agent.set_config_option(THINKING_OPTION_ID, session_id, "off")
+    await agent.set_config_option(config_id=THINKING_OPTION_ID, session_id=session_id, value="off")
     await agent.prompt([text_block("第二轮")], session_id)
     assert backend.thinking_calls == [None, False]
 
-    await agent.set_config_option(THINKING_OPTION_ID, session_id, "on")
+    await agent.set_config_option(config_id=THINKING_OPTION_ID, session_id=session_id, value="on")
     await agent.prompt([text_block("第三轮")], session_id)
     assert backend.thinking_calls == [None, False, True]
 
@@ -678,7 +680,43 @@ async def test_thinking_override_not_leaked_across_sessions():
     first = (await agent.new_session("/tmp")).session_id
     second = (await agent.new_session("/tmp")).session_id
 
-    await agent.set_config_option(THINKING_OPTION_ID, first, "off")
+    await agent.set_config_option(config_id=THINKING_OPTION_ID, session_id=first, value="off")
     await agent.prompt([text_block("hi")], first)
     await agent.prompt([text_block("hi")], second)
     assert backend.thinking_calls == [False, None]
+
+
+async def test_set_config_option_wire_path_via_sdk_router_dispatch():
+    """wire 真实路径集成回归：请求经 acp SDK router 分发（daemon stdio 直连同构）。
+
+    SDK router 按请求模型字段名以关键字调用 handler（``model_to_kwargs``），
+    handler 形参与 SDK 接口签名漂移时本用例必 TypeError——防止单测以位置
+    参数直调绕过分发层、形成「全绿但 wire 必炸」的假阳性再度发生。
+    """
+    backend = FakeBackend()
+    agent, _ = make_agent(backend)
+    session_id = (await agent.new_session("/tmp")).session_id
+    router = build_agent_router(agent)
+    method = AGENT_METHODS["session_set_config_option"]
+    # daemon 下发形态（acp_effort.go 同构）：camelCase 键、无 type 字段 → Select 请求模型
+    wire_params = {"sessionId": session_id, "configId": "thinking", "value": "on"}
+
+    result = await router(method, dict(wire_params, value="on"), False)
+    opt = result["configOptions"][0]
+    assert opt["id"] == "thinking"
+    assert opt["currentValue"] == "on"
+
+    result = await router(method, dict(wire_params, value="off"), False)
+    assert result["configOptions"][0]["currentValue"] == "off"
+
+    # 覆盖真实生效：经 wire 写入的覆盖驱动下一轮 turn
+    await agent.prompt([text_block("hi")], session_id)
+    assert backend.thinking_calls == [False]
+
+    # 词表外 id / 值经 wire 路径显式拒绝（invalid_params）
+    with pytest.raises(RequestError) as exc:
+        await router(method, {"sessionId": session_id, "configId": "effort", "value": "off"}, False)
+    assert exc.value.code == -32602
+    with pytest.raises(RequestError) as exc:
+        await router(method, {"sessionId": session_id, "configId": "thinking", "value": "medium"}, False)
+    assert exc.value.code == -32602

@@ -403,7 +403,7 @@ class DeerFlowAgent:
         logger.info("会话 %s 的模型已设置为 %s（下一轮 turn 生效）", session_id, model_id)
         return SetSessionModelResponse()
 
-    async def set_config_option(self, config_option_id: str, session_id: str, value: Any, **kwargs: Any) -> Any:
+    async def set_config_option(self, config_id: str, session_id: str, value: Any, **kwargs: Any) -> Any:
         """``session/set_config_option``：为会话设置思考开关。
 
         语义（显式选定，均有测试覆盖）：
@@ -429,11 +429,11 @@ class DeerFlowAgent:
                 {"sessionId": session_id, "hint": "先调用 session/new，或用 session/load 恢复已有会话"},
             ) from None
 
-        if config_option_id != THINKING_CONFIG_OPTION_ID:
+        if config_id != THINKING_CONFIG_OPTION_ID:
             raise RequestError.invalid_params(
                 {
                     "reason": "不支持的配置选项",
-                    "configId": config_option_id,
+                    "configId": config_id,
                     "supportedIds": [THINKING_CONFIG_OPTION_ID],
                 }
             )
