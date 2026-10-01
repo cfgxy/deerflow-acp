@@ -107,7 +107,7 @@ def registry(state: Path, **cfg: Any) -> SessionRegistry:
 class _UnusedBackend:
     """SessionRegistry 只用它做 thread_exists；turn 执行完全走 runner。"""
 
-    def stream(self, message: str, *, thread_id: str):  # pragma: no cover - 不应被调用
+    def stream(self, message: str, *, thread_id: str, model_name: str | None = None, thinking_enabled: bool | None = None):  # pragma: no cover - 不应被调用
         raise AssertionError("turn 必须由 worker 子进程执行")
 
     def thread_exists(self, thread_id: str) -> bool:

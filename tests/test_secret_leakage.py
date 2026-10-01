@@ -194,7 +194,9 @@ class ClosePoisonBackend:
         self.secret = secret
         self.gate = threading.Event()
 
-    def stream(self, message: str, *, thread_id: str, model_name: str | None = None) -> Any:
+    def stream(self, message: str, *, thread_id: str, model_name: str | None = None,
+        thinking_enabled: bool | None = None,
+    ) -> Any:
         secret = self.secret
         gate = self.gate
 

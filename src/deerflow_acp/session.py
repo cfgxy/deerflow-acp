@@ -124,6 +124,10 @@ class Session:
     #: None = 未覆盖，沿用进程级默认（与既有行为一致）。
     #: 跨进程恢复（父进程重启后 resume）不带此状态，显式回到默认模型。
     model_override: str | None = None
+    #: 会话级思考开关覆盖（``session/set_config_option(id="thinking")`` 写入）。
+    #: 生命周期语义与 ``model_override`` 完全一致：None = 未覆盖，沿用
+    #: ``BridgeConfig.thinking_enabled``（DEERFLOW_ACP_THINKING 静态默认）。
+    thinking_override: bool | None = None
     #: 会话在 turn 运行期间收到过 ``session/close``。turn 结束后才能真正摘除注册项，
     #: 否则客户端可以在旧 worker 还活着时 resume 回来发新 prompt。
     close_requested: bool = False
@@ -287,6 +291,7 @@ class SessionRegistry:
         on_event: Any,
         *,
         model_name: str | None = None,
+        thinking_enabled: bool | None = None,
     ) -> TurnOutcome:
         """驱动一次 turn，把 DeerFlow 事件逐条交给 ``on_event`` 协程。
 
@@ -300,6 +305,8 @@ class SessionRegistry:
             on_event: ``async (event_type, data) -> None``，在事件循环中执行。
             model_name: 本轮的模型覆盖（来自会话级 ``model_override``）；
                 None 表示沿用进程级默认。
+            thinking_enabled: 本轮的思考开关覆盖（来自会话级
+                ``thinking_override``）；None 表示沿用进程级静态默认。
         """
         if session.quarantined:
             raise SessionQuarantinedError(session.session_id, session.quarantined_pgid)
@@ -323,6 +330,7 @@ class SessionRegistry:
                 cancel_event=cancel_event,
                 grace=grace,
                 model_name=model_name,
+                thinking_enabled=thinking_enabled,
             )
         finally:
             # 释放 running 之前必须先问执行器：这一轮的进程组确认终结了吗？

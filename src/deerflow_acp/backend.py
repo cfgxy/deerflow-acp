@@ -55,12 +55,15 @@ class DeerFlowBackend(Protocol):
         *,
         thread_id: str,
         model_name: str | None = None,
+        thinking_enabled: bool | None = None,
     ) -> Iterator[tuple[str, dict[str, Any]]]:
         """产出 ``(event_type, data)`` 二元组；必须是可 ``close()`` 的生成器。
 
         ``model_name`` 是本会话的逐轮模型覆盖：None 表示不覆盖，沿用后端
         进程级默认——实现**不得**把 None 当作显式模型名传给 DeerFlow，
         否则会把已配置的默认模型清掉。
+        ``thinking_enabled`` 是本会话的逐轮思考开关覆盖，语义同上：None
+        表示不覆盖（沿用静态默认）；False 是合法值、必须显式传递。
         """
         ...
 
@@ -120,11 +123,16 @@ class EmbeddedDeerFlowBackend:
         *,
         thread_id: str,
         model_name: str | None = None,
+        thinking_enabled: bool | None = None,
     ) -> Iterator[tuple[str, dict[str, Any]]]:
         client = self._ensure_client()
-        # DeerFlow 的 stream(**kwargs) 支持逐轮 model_name 覆盖；None 时不传，
-        # 让 client 沿用它自己的默认（含构造期 DEER_FLOW_ACP_MODEL 覆盖）。
+        # DeerFlow 的 stream(**kwargs) 支持逐轮 model_name / thinking_enabled
+        # 覆盖（_get_runnable_config 的 overrides 优先于构造期默认）；None 时
+        # 不传，让 client 沿用它自己的默认（含构造期 DEER_FLOW_ACP_* 覆盖）。
+        # thinking_enabled 的 False 是合法值，判据必须是 is not None。
         kwargs: dict[str, Any] = {"model_name": model_name} if model_name else {}
+        if thinking_enabled is not None:
+            kwargs["thinking_enabled"] = thinking_enabled
         direct_env_secrets = _collect_direct_env_secrets()
         if direct_env_secrets:
             kwargs["direct_env_secrets"] = direct_env_secrets
