@@ -125,6 +125,7 @@ class EmbeddedDeerFlowBackend:
         # DeerFlow 的 stream(**kwargs) 支持逐轮 model_name 覆盖；None 时不传，
         # 让 client 沿用它自己的默认（含构造期 DEER_FLOW_ACP_MODEL 覆盖）。
         kwargs: dict[str, Any] = {"model_name": model_name} if model_name else {}
+        kwargs["recursion_limit"] = self._config.recursion_limit
         direct_env_secrets = _collect_direct_env_secrets()
         if direct_env_secrets:
             kwargs["direct_env_secrets"] = direct_env_secrets

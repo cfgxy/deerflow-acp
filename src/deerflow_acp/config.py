@@ -17,6 +17,10 @@ from typing import Any
 DEFAULT_CANCEL_GRACE_SECONDS = 5.0
 # stdin 断连后等待在途 turn 收尾的时限（秒），超时直接退出进程。
 DEFAULT_SHUTDOWN_GRACE_SECONDS = 5.0
+# 每个 turn 的 LangGraph super-step 预算。嵌入路径 DeerFlowClient 默认 100，
+# 中间件多的图一轮工具循环就要消耗多个 super-step，自主任务很容易触顶
+# GraphRecursionError；这里给足余量，仍可用环境变量按需收紧。
+DEFAULT_RECURSION_LIMIT = 500
 
 
 def _env_get(name: str, legacy_name: str) -> str | None:
@@ -30,6 +34,17 @@ def _env_float(name: str, legacy_name: str, default: float) -> float:
         return default
     try:
         value = float(raw)
+    except ValueError:
+        return default
+    return value if value > 0 else default
+
+
+def _env_int(name: str, legacy_name: str, default: int) -> int:
+    raw = _env_get(name, legacy_name)
+    if not raw:
+        return default
+    try:
+        value = int(raw)
     except ValueError:
         return default
     return value if value > 0 else default
@@ -60,6 +75,7 @@ class BridgeConfig:
         context_window_tokens: 显式提供上下文窗口大小后才允许开启
             ``usage_update``；用于用户明知语义近似仍希望看到进度条的场景。
         client_extra: 透传给 ``DeerFlowClient`` 的额外构造参数。
+        recursion_limit: 每个 turn 的 LangGraph ``recursion_limit``。
     """
 
     deerflow_config_path: str | None = None
@@ -70,6 +86,7 @@ class BridgeConfig:
     emit_usage_update: bool = False
     context_window_tokens: int | None = None
     client_extra: dict[str, Any] = field(default_factory=dict)
+    recursion_limit: int = DEFAULT_RECURSION_LIMIT
 
     @classmethod
     def from_env(cls) -> BridgeConfig:
@@ -99,4 +116,5 @@ class BridgeConfig:
             # 只有同时给出窗口大小，usage_update 才是有意义的；否则保持关闭。
             emit_usage_update=emit_requested and context_window_tokens is not None,
             context_window_tokens=context_window_tokens,
+            recursion_limit=_env_int("DEER_FLOW_ACP_RECURSION_LIMIT", "DEERFLOW_ACP_RECURSION_LIMIT", DEFAULT_RECURSION_LIMIT),
         )

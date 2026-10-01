@@ -39,6 +39,11 @@ logger = get_logger("runner")
 #: 否则取消到达时我们正睡在「等下一条事件」上，宽限期根本不会开始计时。
 _CANCEL_POLL_SECONDS = 0.05
 
+#: worker IPC 通道的 asyncio 单行上限。事件按 ndJSON 单行传输，一条大
+#: tool_result（如读取 50KB+ 源文件）JSON 转义后单行远超 asyncio 默认 64KB，
+#: 超限会让 ``proc.stdout.readline()`` 抛 LimitOverrunError 并杀死整个 turn。
+_IPC_LINE_LIMIT = 64 * 1024 * 1024
+
 #: ``killpg(SIGKILL)`` 之后等待进程被回收的时限。内核层面这是即时的，
 #: 给出上限只是为了绝不无限等待。
 _REAP_TIMEOUT_SECONDS = 10.0
@@ -172,6 +177,7 @@ class SubprocessTurnRunner:
             "deerflow_acp.worker",
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
+            limit=_IPC_LINE_LIMIT,
             # stderr 继承桥进程：worker 的日志与桥的日志同流，都只走 stderr。
             stderr=None,
             # 独立进程组——这是 killpg 能连带回收 DeerFlow 派生的工具子进程的前提。
