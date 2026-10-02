@@ -128,6 +128,12 @@ class Session:
     #: 生命周期语义与 ``model_override`` 完全一致：None = 未覆盖，沿用
     #: ``BridgeConfig.thinking_enabled``（DEER_FLOW_ACP_THINKING 静态默认）。
     thinking_override: bool | None = None
+    #: 已作为输出下发给客户端的 DeerFlow 消息 id 与 tool_call_id（跨 turn 累积）。
+    #: DeerFlow 的 values 快照在后续 turn 会把 checkpoint 历史重新合成
+    #: messages-tuple 下发（client 侧 seen_ids/streamed_ids 只做单次 stream()
+    #: 内去重），桥靠这个集合识别跨轮重放并抑制（RUYI-365 回声）。注册表在
+    #: 父进程内存中；冷恢复（load/resume）时由 history() 从 checkpoint 预填。
+    delivered_message_ids: set[str] = field(default_factory=set)
     #: 会话在 turn 运行期间收到过 ``session/close``。turn 结束后才能真正摘除注册项，
     #: 否则客户端可以在旧 worker 还活着时 resume 回来发新 prompt。
     close_requested: bool = False

@@ -125,6 +125,23 @@ def _available_model_ids(models: dict[str, Any] | None) -> set[str]:
     return {entry["name"] for entry in entries if isinstance(entry, dict) and isinstance(entry.get("name"), str)}
 
 
+def _history_replay_ids(messages: list[dict[str, Any]]) -> set[str]:
+    """从 checkpoint 历史提取跨轮重放抑制集合（消息 id 与 tool_call_id）。
+
+    不区分消息类型：human/system 的 id 不会出现在 AI/工具事件的抑制检查里，
+    收进集合只是无害冗余；而 tool 消息即使没有重放形态（见 ``_replay_history``），
+    它的 tool_call_id 也必须登记，否则下一轮 values 快照重放工具结果时会
+    重复声明已完结的 tool call。
+    """
+    ids: set[str] = set()
+    for message in messages:
+        for key in ("id", "tool_call_id"):
+            value = message.get(key)
+            if isinstance(value, str) and value:
+                ids.add(value)
+    return ids
+
+
 def _quarantine_error(session_id: str) -> RequestError:
     """会话被隔离时给客户端的错误。
 
@@ -244,6 +261,7 @@ class DeerFlowAgent:
         本地会话记录，重放会造成 UI 重复。
         """
         session = self._resume_session(session_id, cwd, mcp_servers)
+        await self._seed_replay_guard(session)
         # resume 是多回合的常态路径：选项面必须同样可用，否则客户端在
         # 后续回合拿不到可下发的选项 id 与词表（覆盖已随旧进程消失，
         # 这里回带的 current 就是本回合真正生效的值）。
@@ -272,7 +290,7 @@ class DeerFlowAgent:
             ) from None
 
         message = _text_from_prompt(prompt)
-        normalizer = EventNormalizer()
+        normalizer = EventNormalizer(delivered_message_ids=session.delivered_message_ids)
 
         async def on_event(event_type: str, data: dict[str, Any]) -> None:
             for update in normalizer.normalize(event_type, data):
@@ -580,6 +598,10 @@ class DeerFlowAgent:
                 ERROR_BACKEND_UNAVAILABLE, "DeerFlow 后端不可用", {"detail": redact_text(exc)}
             ) from None
 
+        # 重放出去的历史同样登记进抑制集合：下一个 turn 的 values 快照会把
+        # 同一批消息重新合成 events，不登记就会紧跟重放再来一遍回声。
+        session.delivered_message_ids |= _history_replay_ids(messages)
+
         for message in messages:
             kind = message.get("type")
             text = message.get("content")
@@ -594,6 +616,27 @@ class DeerFlowAgent:
                 # tool_call_update 要求先有 tool_call 声明），跳过而不伪造。
                 continue
             await self._conn.session_update(session_id=session.session_id, update=update)
+
+    async def _seed_replay_guard(self, session: Session) -> None:
+        """冷恢复（resume）时从 checkpoint 历史预填跨轮重放抑制集合。
+
+        resume 契约是客户端已持有历史、桥不重放；但下一个 turn 的 values
+        快照仍会把全部历史消息重新合成 messages-tuple 下发，不预填就会把
+        整段历史当作新输出回放。热会话（本进程内已继续对话）已有真实记录，
+        跳过预填。
+        """
+        if session.delivered_message_ids:
+            return
+        history_fn = getattr(self._backend, "history", None)
+        if not callable(history_fn):
+            return
+        try:
+            messages = await asyncio.to_thread(history_fn, session.session_id)
+        except BackendUnavailableError as exc:
+            raise RequestError(
+                ERROR_BACKEND_UNAVAILABLE, "DeerFlow 后端不可用", {"detail": redact_text(exc)}
+            ) from None
+        session.delivered_message_ids |= _history_replay_ids(messages)
 
     def _build_usage(self, payload: dict[str, Any] | None) -> Usage | None:
         if not isinstance(payload, dict):

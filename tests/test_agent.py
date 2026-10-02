@@ -720,3 +720,61 @@ async def test_set_config_option_wire_path_via_sdk_router_dispatch():
     with pytest.raises(RequestError) as exc:
         await router(method, {"sessionId": session_id, "configId": "thinking", "value": "medium"}, False)
     assert exc.value.code == -32602
+
+
+# ----------------------------------------------------------------------
+# 跨轮重放抑制（RUYI-365 回声问题）
+# ----------------------------------------------------------------------
+
+
+async def test_second_turn_suppresses_previous_turn_echo():
+    """回归：第二轮事件流重放上一轮 AI 消息，客户端不得收到重复文本。"""
+    backend = FakeBackend(
+        [("messages-tuple", {"type": "ai", "content": "你好，我是 DeerFlow 欢迎语", "id": "m-welcome"}), ("end", {"usage": {}})]
+    )
+    agent, conn = make_agent(backend)
+    session_id = (await agent.new_session("/tmp")).session_id
+
+    await agent.prompt([text_block("hi")], session_id)
+    backend.events = [
+        # DeerFlow values 快照把上一轮欢迎语重新合成为 messages-tuple 下发
+        ("messages-tuple", {"type": "ai", "content": "你好，我是 DeerFlow 欢迎语", "id": "m-welcome"}),
+        ("messages-tuple", {"type": "ai", "content": "针对第二轮问题的回答", "id": "m-new"}),
+        ("end", {"usage": {}}),
+    ]
+    await agent.prompt([text_block("调研 V100 大模型")], session_id)
+
+    assert conn.texts("agent_message_chunk") == ["你好，我是 DeerFlow 欢迎语", "针对第二轮问题的回答"]
+
+
+async def test_resume_seeds_replay_guard_from_history():
+    """冷恢复（resume）不重放历史，但下一轮 values 重放历史时必须被抑制。"""
+    backend = FakeBackend(
+        [("messages-tuple", {"type": "ai", "content": "旧回答重放", "id": "m-old"}), ("end", {"usage": {}})],
+        threads={"df-known": [{"type": "ai", "content": "旧回答", "id": "m-old"}]},
+    )
+    agent, conn = make_agent(backend)
+    await agent.resume_session("/tmp", "df-known")
+    assert conn.updates == []
+
+    await agent.prompt([text_block("继续")], "df-known")
+    assert conn.texts("agent_message_chunk") == []
+
+
+async def test_load_session_then_next_turn_suppresses_history_echo():
+    """load 重放历史照常可见；其后的 turn 不得把同一段历史再发一遍。"""
+    backend = FakeBackend(
+        [("messages-tuple", {"type": "ai", "content": "旧回答", "id": "m-old"}), ("end", {"usage": {}})],
+        threads={
+            "df-known": [
+                {"type": "human", "content": "问题", "id": "h1"},
+                {"type": "ai", "content": "旧回答", "id": "m-old"},
+            ]
+        },
+    )
+    agent, conn = make_agent(backend)
+    await agent.load_session("/tmp", "df-known")
+    assert conn.texts("agent_message_chunk") == ["旧回答"]
+
+    await agent.prompt([text_block("继续")], "df-known")
+    assert conn.texts("agent_message_chunk") == ["旧回答"]
