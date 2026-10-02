@@ -171,3 +171,65 @@ def test_unknown_event_type_is_dropped():
 )
 def test_tool_kind_mapping(name, expected):
     assert tool_kind_for(name) == expected
+
+
+# ----------------------------------------------------------------------
+# 跨轮重放抑制（RUYI-365 回声问题）
+# ----------------------------------------------------------------------
+
+
+def test_previous_turn_ai_message_replay_is_suppressed():
+    """同一 thread 第二轮事件流重放上一轮 AI 消息时，不得再次作为新输出下发。"""
+    delivered: set[str] = set()
+    turn1 = EventNormalizer(delivered_message_ids=delivered)
+    updates = turn1.normalize("messages-tuple", {"type": "ai", "content": "你好，我是 DeerFlow 助手", "id": "m-welcome"})
+    assert kinds(updates) == ["agent_message_chunk"]
+    assert delivered == {"m-welcome"}
+
+    turn2 = EventNormalizer(delivered_message_ids=delivered)
+    assert turn2.normalize("messages-tuple", {"type": "ai", "content": "你好，我是 DeerFlow 助手", "id": "m-welcome"}) == []
+
+
+def test_second_turn_new_message_still_delivered():
+    """抑制只针对历史 id：第二轮真正的新消息必须照常下发。"""
+    delivered: set[str] = set()
+    turn1 = EventNormalizer(delivered_message_ids=delivered)
+    turn1.normalize("messages-tuple", {"type": "ai", "content": "第一轮回答", "id": "m1"})
+
+    turn2 = EventNormalizer(delivered_message_ids=delivered)
+    updates = turn2.normalize("messages-tuple", {"type": "ai", "content": "第二轮回答", "id": "m2"})
+    assert kinds(updates) == ["agent_message_chunk"]
+    assert updates[0].content.text == "第二轮回答"
+
+
+def test_shared_delivered_set_does_not_suppress_same_turn_deltas():
+    """同一 turn 内同 id 的后续增量不算重放，正常下发。"""
+    delivered: set[str] = set()
+    n = EventNormalizer(delivered_message_ids=delivered)
+    n.normalize("messages-tuple", {"type": "ai", "content": "第一段", "id": "m1"})
+    second = n.normalize("messages-tuple", {"type": "ai", "content": "第二段", "id": "m1"})
+    assert kinds(second) == ["agent_message_chunk"]
+    assert second[0].content.text == "第二段"
+
+
+def test_previous_turn_tool_result_replay_is_suppressed():
+    """上一轮的工具结果在新一轮被 values 快照重放时，不再重复声明与完结。"""
+    delivered: set[str] = set()
+    turn1 = EventNormalizer(delivered_message_ids=delivered)
+    turn1.normalize("messages-tuple", {"type": "ai", "content": "", "id": "m1", "tool_calls": [{"name": "web_search", "args": {}, "id": "t1"}]})
+    turn1.normalize("messages-tuple", {"type": "tool", "content": "命中", "name": "web_search", "tool_call_id": "t1", "id": "m2"})
+
+    turn2 = EventNormalizer(delivered_message_ids=delivered)
+    assert turn2.normalize("messages-tuple", {"type": "tool", "content": "命中", "name": "web_search", "tool_call_id": "t1", "id": "m2"}) == []
+    updates = turn2.normalize("messages-tuple", {"type": "tool", "content": "新结果", "name": "crawl", "tool_call_id": "t9", "id": "m3"})
+    assert kinds(updates) == ["tool_call", "tool_call_update"]
+
+
+def test_replayed_reasoning_is_suppressed():
+    """重放消息携带的 reasoning 同属历史内容，一并抑制。"""
+    delivered: set[str] = set()
+    turn1 = EventNormalizer(delivered_message_ids=delivered)
+    turn1.normalize("messages-tuple", {"type": "ai", "content": "答案", "id": "m1", "additional_kwargs": {"reasoning_content": "推理"}})
+
+    turn2 = EventNormalizer(delivered_message_ids=delivered)
+    assert turn2.normalize("messages-tuple", {"type": "ai", "content": "答案", "id": "m1", "additional_kwargs": {"reasoning_content": "推理"}}) == []

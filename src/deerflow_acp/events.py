@@ -106,10 +106,22 @@ class EventNormalizer:
     _announced_tools: dict[str, str] = field(default_factory=dict)
     #: message_id → 已下发的 reasoning 文本，用于把累计值转成增量
     _reasoning_sent: dict[str, str] = field(default_factory=dict)
+    #: 会话级「已下发消息 id」集合（跨 turn 共享，由 Session 持有并传入）。
+    #: DeerFlowClient 的 seen_ids/streamed_ids 只在单次 stream() 内去重，
+    #: values 快照在后续 turn 会把 checkpoint 历史重新合成 messages-tuple
+    #: 下发；桥靠本集合识别并抑制这种跨轮重放，避免上一轮响应在新一轮
+    #: 被原样回放。
+    delivered_message_ids: set[str] = field(default_factory=set)
     #: 本 turn 的最终 usage
     usage: TurnUsage | None = None
     #: 已产生过任何 agent 可见输出（用于判定空 turn）
     produced_output: bool = False
+
+    def __post_init__(self) -> None:
+        # turn 开始时的快照：turn 内只抑制快照命中者。turn 内新登记的 id
+        # 不得进入快照——同一条 AI 消息的文本按 delta 分多次到达、共用
+        # 同一个 message_id，逐条查集合会把后续增量误判成重放。
+        self._replayed_ids: set[str] = set(self.delivered_message_ids)
 
     def normalize(self, event_type: str, data: dict[str, Any]) -> list[SessionUpdate]:
         """归一化单个 DeerFlow 事件，返回 0..n 条 ACP session update。"""
@@ -147,8 +159,14 @@ class EventNormalizer:
         return []
 
     def _normalize_ai_message(self, data: dict[str, Any]) -> list[SessionUpdate]:
-        updates: list[SessionUpdate] = []
         message_id = data.get("id") or ""
+        if message_id and message_id in self._replayed_ids:
+            # 历史消息在新 turn 的重放：文本、reasoning、tool_calls 全部
+            # 属于已下发过的内容，整体抑制，一个字节都不再作为新输出。
+            logger.debug("抑制历史 AI 消息重放：%s", message_id)
+            return []
+
+        updates: list[SessionUpdate] = []
 
         # thought 先于正文：推理内容在时间上总是发生在最终答案之前。
         reasoning_delta = self._reasoning_delta(message_id, data.get("additional_kwargs"))
@@ -164,6 +182,8 @@ class EventNormalizer:
             if update is not None:
                 updates.append(update)
 
+        if updates and message_id:
+            self.delivered_message_ids.add(message_id)
         return updates
 
     def _reasoning_delta(self, message_id: str, additional_kwargs: Any) -> str:
@@ -214,6 +234,9 @@ class EventNormalizer:
         if not tool_call_id:
             logger.warning("DeerFlow tool 结果缺少 tool_call_id，已跳过")
             return []
+        if tool_call_id in self._replayed_ids:
+            logger.debug("抑制历史工具结果重放：%s", tool_call_id)
+            return []
 
         name = data.get("name") or self._announced_tools.get(tool_call_id) or "tool"
         updates: list[SessionUpdate] = []
@@ -234,6 +257,7 @@ class EventNormalizer:
                 raw_output=raw_output if isinstance(raw_output, dict) else None,
             )
         )
+        self.delivered_message_ids.add(tool_call_id)
         return updates
 
     # ------------------------------------------------------------------
