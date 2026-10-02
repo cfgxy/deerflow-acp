@@ -34,13 +34,12 @@ def thinking_value(enabled: bool) -> str:
     return "on" if enabled else "off"
 
 
-def _env_get(name: str, legacy_name: str) -> str | None:
-    """新名优先；旧 ``DEERFLOW_ACP_`` 前缀名已废弃，仅作兼容回退。"""
-    return os.environ.get(name) or os.environ.get(legacy_name)
+def _env_get(name: str) -> str | None:
+    return os.environ.get(name)
 
 
-def _env_float(name: str, legacy_name: str, default: float) -> float:
-    raw = _env_get(name, legacy_name)
+def _env_float(name: str, default: float) -> float:
+    raw = _env_get(name)
     if not raw:
         return default
     try:
@@ -50,8 +49,8 @@ def _env_float(name: str, legacy_name: str, default: float) -> float:
     return value if value > 0 else default
 
 
-def _env_flag(name: str, legacy_name: str, default: bool) -> bool:
-    raw = _env_get(name, legacy_name)
+def _env_flag(name: str, default: bool) -> bool:
+    raw = _env_get(name)
     if raw is None:
         return default
     return raw.strip().lower() in {"1", "true", "yes", "on"}
@@ -88,7 +87,7 @@ class BridgeConfig:
 
     @classmethod
     def from_env(cls) -> BridgeConfig:
-        context_window = _env_get("DEER_FLOW_ACP_CONTEXT_WINDOW_TOKENS", "DEERFLOW_ACP_CONTEXT_WINDOW_TOKENS")
+        context_window = _env_get("DEER_FLOW_ACP_CONTEXT_WINDOW_TOKENS")
         try:
             context_window_tokens = int(context_window) if context_window else None
         except ValueError:
@@ -96,19 +95,17 @@ class BridgeConfig:
         if context_window_tokens is not None and context_window_tokens <= 0:
             context_window_tokens = None
 
-        emit_requested = _env_flag("DEER_FLOW_ACP_EMIT_USAGE_UPDATE", "DEERFLOW_ACP_EMIT_USAGE_UPDATE", False)
+        emit_requested = _env_flag("DEER_FLOW_ACP_EMIT_USAGE_UPDATE", False)
         return cls(
-            deerflow_config_path=_env_get("DEER_FLOW_CONFIG_PATH", "DEERFLOW_ACP_CONFIG_PATH") or None,
-            model_name=_env_get("DEER_FLOW_ACP_MODEL", "DEERFLOW_ACP_MODEL") or None,
-            thinking_enabled=_env_flag("DEER_FLOW_ACP_THINKING", "DEERFLOW_ACP_THINKING", True),
+            deerflow_config_path=_env_get("DEER_FLOW_CONFIG_PATH") or None,
+            model_name=_env_get("DEER_FLOW_ACP_MODEL") or None,
+            thinking_enabled=_env_flag("DEER_FLOW_ACP_THINKING", True),
             cancel_grace_seconds=_env_float(
                 "DEER_FLOW_ACP_CANCEL_GRACE_SECONDS",
-                "DEERFLOW_ACP_CANCEL_GRACE_SECONDS",
                 DEFAULT_CANCEL_GRACE_SECONDS,
             ),
             shutdown_grace_seconds=_env_float(
                 "DEER_FLOW_ACP_SHUTDOWN_GRACE_SECONDS",
-                "DEERFLOW_ACP_SHUTDOWN_GRACE_SECONDS",
                 DEFAULT_SHUTDOWN_GRACE_SECONDS,
             ),
             # 只有同时给出窗口大小，usage_update 才是有意义的；否则保持关闭。

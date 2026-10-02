@@ -126,7 +126,7 @@ class Session:
     model_override: str | None = None
     #: 会话级思考开关覆盖（``session/set_config_option(id="thinking")`` 写入）。
     #: 生命周期语义与 ``model_override`` 完全一致：None = 未覆盖，沿用
-    #: ``BridgeConfig.thinking_enabled``（DEERFLOW_ACP_THINKING 静态默认）。
+    #: ``BridgeConfig.thinking_enabled``（DEER_FLOW_ACP_THINKING 静态默认）。
     thinking_override: bool | None = None
     #: 会话在 turn 运行期间收到过 ``session/close``。turn 结束后才能真正摘除注册项，
     #: 否则客户端可以在旧 worker 还活着时 resume 回来发新 prompt。

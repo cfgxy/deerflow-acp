@@ -11,12 +11,7 @@ _DEFAULT_LEVEL = "INFO"
 
 
 def _resolve_level(explicit: str | None = None) -> int:
-    raw = (
-        explicit
-        or os.environ.get("DEER_FLOW_ACP_LOG_LEVEL")
-        or os.environ.get("DEERFLOW_ACP_LOG_LEVEL")  # 旧前缀名，已废弃，仅作兼容回退
-        or _DEFAULT_LEVEL
-    )
+    raw = explicit or os.environ.get("DEER_FLOW_ACP_LOG_LEVEL") or _DEFAULT_LEVEL
     level = logging.getLevelName(raw.strip().upper())
     return level if isinstance(level, int) else logging.INFO
 

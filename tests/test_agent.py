@@ -565,7 +565,7 @@ async def test_new_session_broadcasts_thinking_config_option():
     assert opt.category == "thought_level"
     assert opt.type == "select"
     assert [(o.value, o.name) for o in opt.options] == [("on", "On"), ("off", "Off")]
-    # 未设置覆盖时 current 反映静态默认（DEERFLOW_ACP_THINKING，缺省 on）
+    # 未设置覆盖时 current 反映静态默认（DEER_FLOW_ACP_THINKING，缺省 on）
     assert opt.current_value == "on"
 
 
