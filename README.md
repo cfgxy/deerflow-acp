@@ -132,3 +132,15 @@ DEER_FLOW_ACP_E2E=1 .venv/bin/pytest -q tests/test_e2e_deerflow.py   # 需要本
 契约测试（`tests/test_contract_ndjson.py`）默认走进程内后端验证 JSON-RPC 报文形状；
 带 `worker_path` 前缀的用例设 `DEER_FLOW_ACP_FAKE_USE_WORKER=1`，跑**生产路径**——
 真子进程、真进程组、真 `killpg`，并由 worker 自报 pid/pgid 供父进程断言回收。
+
+### CI 与本地等价命令
+
+GitHub Actions（`.github/workflows/ci.yml`）在每次 push 与 pull request 上运行全量
+测试套件：安装 uv → `uv sync --extra dev` → `uv run --extra dev pytest -q`，
+结果见 PR checks。E2E 用例需 `DEER_FLOW_ACP_E2E=1` 显式开启，CI 中保持跳过。
+本地复现 CI 行为：
+
+```bash
+uv sync --extra dev
+uv run --extra dev pytest -q
+```
