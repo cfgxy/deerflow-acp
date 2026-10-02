@@ -413,7 +413,7 @@ class DeerFlowAgent:
           「广播词表之外的假档位」。
         * 覆盖存在父进程 ``SessionRegistry`` 的会话对象上，从下一轮 turn
           开始生效，在途 turn 不受影响；空值语义=未覆盖时沿用
-          ``DEERFLOW_ACP_THINKING`` 静态默认（ACP 层无空档位，客户端
+          ``DEER_FLOW_ACP_THINKING`` 静态默认（ACP 层无空档位，客户端
           不发请求即回到默认）。
         * 响应回带刷新后的选项（currentValue=新值），客户端的读回确认
           有据可依。
@@ -516,7 +516,7 @@ class DeerFlowAgent:
     def _build_thinking_option(self, session: Session) -> SessionConfigOptionSelect:
         """构造思考开关的 ACP 选项面，current 反映该会话当前真正生效的值。
 
-        覆盖未设置时回带静态默认（DEERFLOW_ACP_THINKING），保证
+        覆盖未设置时回带静态默认（DEER_FLOW_ACP_THINKING），保证
         current_value 永远落在可选项内——客户端把它渲染为当前档位，
         不会出现「裸显 token」。
         """

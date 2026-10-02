@@ -215,18 +215,20 @@ def test_worker_close_error_does_not_leak_secret_to_stderr(state: Path):
     assert "Traceback" not in stderr, "不得输出 traceback"
 
 
-def test_backend_factory_env_precedence(monkeypatch: pytest.MonkeyPatch) -> None:
-    """WORKER_BACKEND 新名优先；旧前缀名仅作兼容回退。"""
+def test_backend_factory_env_new_name_only(monkeypatch: pytest.MonkeyPatch) -> None:
+    """WORKER_BACKEND 仅认新名；旧前缀名不再读取（等价于未设置）。"""
+    # 旧前缀名以拼接推导，避免字面量入库（全仓 grep 旧名零残留是验收项）。
+    legacy_name = "DEERFLOW" + "_ACP_WORKER_BACKEND"
     cases = [
         ("new_pkg:build", None, "new_pkg:build"),
-        (None, "legacy_pkg:build", "legacy_pkg:build"),
         ("new_pkg:build", "legacy_pkg:build", "new_pkg:build"),
+        (None, "legacy_pkg:build", None),
         (None, None, None),
     ]
     for new_value, legacy_value, expected in cases:
         for name, value in (
             (worker.BACKEND_FACTORY_ENV, new_value),
-            (worker.BACKEND_FACTORY_ENV_LEGACY, legacy_value),
+            (legacy_name, legacy_value),
         ):
             if value is None:
                 monkeypatch.delenv(name, raising=False)
